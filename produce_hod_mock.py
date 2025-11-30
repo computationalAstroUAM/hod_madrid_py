@@ -129,14 +129,14 @@ LBOX = 1000.0                           # Box size in Mpc/h
 FTYPE = 'txt'                           # Possible input file type: txt
 OUTPUT_DIR = Path("output")
 INPUT_DIR = Path("data/example")
-#INFILE = "/home2/guillermo/TFM_JOAQUIN/data/Halos_file_for_hod_Rvir_Rs.txt"
-INFILE = INPUT_DIR / "Halos_tree_x_y_z_vx_vy_vz_logM_Rvir_Rs_id_100000.txt"
+INFILE = "/home2/guillermo/TFM_JOAQUIN/data/Halos_file_for_hod_Rvir_Rs.txt"
+#INFILE = INPUT_DIR / "Halos_tree_x_y_z_vx_vy_vz_logM_Rvir_Rs_id_500000.txt"
 
 # =============================================================================
 # ======================= 2. AVERAGE HOD SHAPE ================================
 # =============================================================================
 
-ANALYTICAL_SHAPE = True                # If true, use analytical functions
+ANALYTICAL_SHAPE = False                # If true, use analytical functions
 TEST_HOD_OCCUPATION = True              # If true, plot HOD occupation
 
 # For an analytical shape, the following parameters are needed:
@@ -154,7 +154,7 @@ GAMMA = -1.4                            # Power law slope for high mass centrals
 
 # If analytical_shape is False, a file should be given:
 HODFIT2SIM = True                       # Set to true if SAM was analyzed with HODFIT2SIM
-CONFORMITY = True                      # If true, use global conformity parameters for HOD shape
+CONFORMITY = False                      # If true, use global conformity parameters for HOD shape
 
 if HODFIT2SIM:
     # Output file from HODfit2sim
@@ -173,7 +173,7 @@ else:
 ANALYTICAL_PDF = True                    # If true, use analytical functions
 
 # For analytical PDF, the following parameters are needed:
-BETA = 0.0                               # Poisson=0, Nearest integer=-2
+BETA = 0.0                             # Poisson=0, Nearest integer=-2
 
 # If analytical_pdf is False, a file should be given:
 if HODFIT2SIM:
