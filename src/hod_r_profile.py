@@ -11,6 +11,74 @@ import src.hod_const as cst
 from src.hod_cosmology import Delta_vir
 
 @jit(nopython=True)
+def f_nfw(x):
+    return np.log(1.0 + x) - x/(1.0 + x)
+
+def build_nfw_cdf_up_to_c(c, ngrid=2048, loggrid=True):
+    """
+    Mallado en x = r/rs hasta x_max = c (i.e., Rvir).
+    Devuelve: x_grid (>=0), cdf(x) normalizada.
+    """
+    if c <= 0.0:
+        raise ValueError("Concentration 'c' must be > 0.")
+    # malla en x: evitar 0 exacto por estabilidad
+    xmin = 1e-12
+    if loggrid:
+        x = np.exp(np.linspace(np.log(xmin), np.log(c), ngrid))
+    else:
+        x = np.linspace(xmin, c, ngrid)
+
+    F = f_nfw(x)
+    Fmax = f_nfw(c)
+    if Fmax <= 0.0:
+        raise ValueError("Invalid NFW normalization; check 'c'.")
+    cdf = F / Fmax
+    return x, cdf
+
+def sample_from_cdf_1d(xgrid, cdf, rng):
+    u = rng.random()
+    j = np.searchsorted(cdf, u, side="right")
+    j = np.clip(j, 1, len(cdf)-1)
+    c0, c1 = cdf[j-1], cdf[j]
+    x0, x1 = xgrid[j-1], xgrid[j]
+    t = (u - c0) / (c1 - c0 + 1e-300)
+    return x0 + t*(x1 - x0)
+
+@jit(nopython=True)
+def Rvir_from_mass(M, Delta_vir, rho_crit):
+    return (3.0*M / (4.0*np.pi*Delta_vir*rho_crit))**(1.0/3.0)
+
+def generate_nfw_position_with_concentration(
+    M, zsnap, omega_M, rho_crit, Delta_vir_func,
+    Rvir, Rs,
+    rng=None,
+    ngrid=4096,
+    loggrid=True
+):
+    """
+    NFW clásico, truncado implícitamente en Rvir (no K_trunc).
+    - Construimos CDF en x=r/rs hasta x=c.
+    - Muestreamos r y dirección isotrópica.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Escalas del halo
+    c_halo = Rvir / Rs
+
+    # CDF hasta x=c (i.e., r<=Rvir)
+    xgrid, cdf = build_nfw_cdf_up_to_c(c_halo, ngrid=ngrid, loggrid=loggrid)
+    x = sample_from_cdf_1d(xgrid, cdf, rng)
+    r = x * Rs
+
+    # Dirección isotrópica
+    phi = rng.uniform(0.0, 2.0*np.pi)
+    mu  = rng.uniform(-1.0, 1.0)
+    s   = np.sqrt(1.0 - mu*mu)
+    Dx, Dy, Dz = r*s*np.cos(phi), r*s*np.sin(phi), r*mu
+    return Dx, Dy, Dz
+
+@jit(nopython=True)
 def concentration_klypin(M, z):
     """Concentration parameter calculation"""
     if z < 0.25:
@@ -66,6 +134,12 @@ def generate_nfw_position(M, K, zsnap, omega_M):
     c_val = concentration_klypin(M, zsnap)
 
     R = mid * R_mass / (c_val*K)
+
+    M_test = 1e12  # masa típica de halo
+    Delta_vir_val = Delta_vir(0, 0.3)
+    R_test = R_from_mass(M_test, Delta_vir_val, c.rho_crit)
+    print(R_test)
+
     
     # Generate spherical coordinates
     phi = np.random.random() * 2 * np.pi
@@ -75,6 +149,42 @@ def generate_nfw_position(M, K, zsnap, omega_M):
     Dy = R * np.sqrt(1.0 - costh*costh) * np.sin(phi)
     Dz = R * costh
     
+    return Dx, Dy, Dz
+
+@jit(nopython=True)
+def generate_nfw_position_from_c(Rvir, Rs):
+    """
+    NFW position generation with given concentration c_val.
+    """
+    x_max = Rvir / Rs
+    c_val = Rvir / Rs
+
+    I_max = I_NFW(x_max)
+    y_rand = np.random.random() * I_max
+
+    tol = 1e-4 * I_max
+    low, high = 0.0, x_max
+    mid = 0.5 * (low + high)
+    y_try = I_NFW(mid)
+
+    while abs(y_try - y_rand) >= tol:
+        if y_try > y_rand:
+            high = mid
+        else:
+            low = mid
+        mid = 0.5 * (low + high)
+        y_try = I_NFW(mid)
+
+    R = mid * Rvir / (c_val)
+
+    phi = np.random.random() * 2.0 * np.pi
+    costh = np.random.random() * 2.0 - 1.0
+    sinth = np.sqrt(1.0 - costh * costh)
+
+    Dx = R * sinth * np.cos(phi)
+    Dy = R * sinth * np.sin(phi)
+    Dz = R * costh
+
     return Dx, Dy, Dz
 
 @jit(nopython=True)

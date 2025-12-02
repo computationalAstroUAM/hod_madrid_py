@@ -13,13 +13,14 @@ import src.hod_shape as shape
 import src.hod_pdf as pdf
 import src.hod_cosmology as cosm
 
-def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, halo_ids, random_seeds,
+def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, random_seeds,
                         hodshape, mu, Ac, As,alpha, sig, gamma, vfact, beta,
                         K, vt, vtdisp, M0, M1, omega_M, Lbox, zsnap,
                         alpha_r, beta_r, N0, r0, kappa_r, extended_NFW = True,
                         vr1=None, vr2=None, vr3=None, mu1=None, mu2=None, mu3=None,
                         sigma1=None, sigma2=None, sigma3=None, extended_vp=True,
-                        v0_tan=None, epsilon_tan=None, omega_tan=None, delta_tan=None):
+                        v0_tan=None, epsilon_tan=None, omega_tan=None, delta_tan=None,
+                        read_concentrations=False, analytical_pdf=False):
     
     """
     Generate central and satellite galaxies for a chunk of halos using an 
@@ -91,6 +92,8 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, halo_ids, random_s
             [14]   : host halo ID
             [15]   : is_central flag (1 = central, 0 = satellite)
             [16]   : halo concentration
+            [17]   : halo Rvir
+            [18]   : halo Rs
 
     Notes
     -----
@@ -114,6 +117,8 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, halo_ids, random_s
         halo_x, halo_y, halo_z = x[i], y[i], z[i]
         halo_vx, halo_vy, halo_vz = vx[i], vy[i], vz[i]
         halo_logM = logM[i]
+        halo_Rvir = Rvir[i]
+        halo_Rs = Rs[i]
         halo_id = halo_ids[i]
         
         # Set random seed for this halo
@@ -124,7 +129,7 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, halo_ids, random_s
 
         # Generate central and satellite counts
         Ncen, Nsat = shape.calculate_hod_occupation(M, mu, Ac, As, alpha,
-                                                    sig, gamma, M0, M1, hodshape)
+                                                    sig, gamma, M0, M1, hodshape, beta)
         # Check if we need to grow the array before processing this halo
         galaxies_needed = Ncen + Nsat
         if galaxy_count + galaxies_needed >= max_galaxies:
@@ -178,7 +183,10 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, halo_ids, random_s
             if extended_NFW == True:
                 Dx, Dy, Dz = rp.generate_extended_position(M, zsnap, omega_M, c.rho_crit, cosm.Delta_vir, K, r0, alpha_r, beta_r, kappa_r, N0, rng=rng_halo)
             else:
-                Dx, Dy, Dz = rp.generate_nfw_position(M=M, zsnap=zsnap, omega_M=omega_M, K=K)
+                if read_concentrations:
+                    Dx, Dy, Dz = rp.generate_nfw_position_from_c(Rvir=halo_Rvir, Rs=halo_Rs)
+                else:
+                    Dx, Dy, Dz = rp.generate_nfw_position(M=M, zsnap=zsnap, omega_M=omega_M, K=K)
 
             if extended_vp == True:
                  r_hat = np.array([Dx, Dy, Dz])
@@ -215,7 +223,7 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, halo_ids, random_s
     # Return only the filled portion of the array
     return galaxies[:galaxy_count, :]
 
-def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, halo_ids, random_seeds,
+def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, random_seeds,
                         vfact, beta, K, vt, vtdisp, omega_M, Lbox, zsnap,
                         alpha_r, beta_r, N0, r0, kappa_r, extended_NFW = True,
                         analytical_vp = None, analytical_rp = None,
@@ -224,7 +232,8 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, halo_ids, random_seeds,
                         r_bin_edges=None, probs_r=None, Nsat_r=None, K1_global=None, K2_global=None,
                         vr1=None, vr2=None, vr3=None, mu1=None, mu2=None, mu3=None,
                         sigma1=None, sigma2=None, sigma3=None, extended_vp=True,
-                        v0_tan=None, epsilon_tan=None, omega_tan=None, delta_tan=None):
+                        v0_tan=None, epsilon_tan=None, omega_tan=None, delta_tan=None,
+                        read_concentrations=False, analytical_pdf=False):
     
     """
     Generate central and satellite galaxies for a chunk of halos using 
@@ -344,6 +353,8 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, halo_ids, random_seeds,
         halo_x, halo_y, halo_z = x[i], y[i], z[i]
         halo_vx, halo_vy, halo_vz = vx[i], vy[i], vz[i]
         halo_logM = logM[i]
+        halo_Rvir = Rvir[i]
+        halo_Rs = Rs[i]
         halo_id = halo_ids[i]
 
         # Set random seed for this halo
@@ -441,7 +452,10 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, halo_ids, random_seeds,
                 if extended_NFW == True:
                     Dx, Dy, Dz = rp.generate_extended_position(M, zsnap, omega_M, c.rho_crit, cosm.Delta_vir, K, r0, alpha_r, beta_r, kappa_r, N0)
                 else:
-                    Dx, Dy, Dz = rp.generate_nfw_position(M=M, zsnap=zsnap, omega_M=omega_M, K=K)
+                    if read_concentrations:
+                        Dx, Dy, Dz = rp.generate_nfw_position_from_c(Rvir=halo_Rvir, Rs=halo_Rs)
+                    else:
+                        Dx, Dy, Dz = rp.generate_nfw_position(M=M, zsnap=zsnap, omega_M=omega_M, K=K)
             else:
                 Dx, Dy, Dz = rp.sample_empirical_position(r_bin_edges, probs_r)
 
@@ -495,7 +509,7 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, halo_ids, random_seeds,
 def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_min=None, M_max=None,
                               Ncen_mean=None, Nsat_mean=None, vr_bin_edges=None, vr_probs=None,
                               vtan_bin_edges=None, vtan_probs=None, r_bin_edges=None, probs_r=None, Nsat_r=None,
-                              K1_global=None, K2_global=None, Rvir=None, Rs=None, conc=None):
+                              K1_global=None, K2_global=None, Rvir=None, Rs=None):
     
     """
     Process a halo catalogue in chunks to generate mock galaxy catalogues 
@@ -595,7 +609,9 @@ def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_
                 vy = chunk_data[:, 4]
                 vz = chunk_data[:, 5]
                 logM = chunk_data[:, 6]
-                halo_ids = chunk_data[:, 7].astype(np.int64)
+                Rvir = chunk_data[:, 7]
+                Rs = chunk_data[:, 8]
+                halo_ids = chunk_data[:, 9].astype(np.int64)
 
                 # Generate random seeds for each halo
                 random_seeds = np.random.randint(0, 2**31, size=len(x))
@@ -605,10 +621,11 @@ def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_
                 
                 if params.analytical_shape:
                     galaxies = process_halos_chunk_analytical(
-                                x=x, y=y, z=z, vx=vx, vy=vy, vz=vz, logM=logM, halo_ids=halo_ids, random_seeds=random_seeds,
+                                x=x, y=y, z=z, vx=vx, vy=vy, vz=vz, logM=logM, Rvir=Rvir, Rs=Rs, halo_ids=halo_ids, random_seeds=random_seeds,
                                 hodshape=params.hodshape, mu=params.mu, Ac=params.Ac, As=params.As,
                                 alpha=params.alpha, sig=params.sig, gamma=params.gamma,
-                                vfact=params.vfact, beta=params.beta, K=params.K, vt=params.vt, 
+                                vfact=params.vfact, beta=params.beta, analytical_pdf=params.analytical_pdf,
+                                K=params.K, vt=params.vt, 
                                 vtdisp=params.vtdisp, M0=params.M0, M1=params.M1,
                                 omega_M=params.omega_M, Lbox=params.Lbox, zsnap=params.zsnap,
                                 alpha_r=params.alpha_r, beta_r=params.beta_r, N0=params.N0, r0=params.r0,
@@ -617,14 +634,16 @@ def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_
                                 mu1=params.mu1, mu2=params.mu2, mu3=params.mu3,
                                 sigma1=params.sigma1, sigma2=params.sigma2, sigma3=params.sigma3,
                                 extended_vp=params.extended_vp, v0_tan=params.v0_tan, epsilon_tan=params.epsilon_tan,
-                                omega_tan=params.omega_tan, delta_tan=params.delta_tan
+                                omega_tan=params.omega_tan, delta_tan=params.delta_tan, 
+                                read_concentrations=params.read_concentrations
                                 )
                 else:
                     galaxies = process_halos_chunk_bins(
-                                x=x, y=y, z=z, vx=vx, vy=vy, vz=vz, logM=logM, halo_ids=halo_ids, random_seeds=random_seeds,
+                                x=x, y=y, z=z, vx=vx, vy=vy, vz=vz, logM=logM, Rvir=Rvir, Rs=Rs, halo_ids=halo_ids, random_seeds=random_seeds,
                                 vfact=params.vfact, beta=params.beta, K=params.K, vt=params.vt, vtdisp=params.vtdisp,
                                 omega_M=params.omega_M, Lbox=params.Lbox, zsnap=params.zsnap,
-                                alpha_r=params.alpha_r, beta_r=params.beta_r, N0=params.N0,
+                                alpha_r=params.alpha_r, beta_r=params.beta_r,
+                                analytical_pdf=params.analytical_pdf, N0=params.N0,
                                 r0=params.r0, kappa_r=params.kappa_r, extended_NFW=params.extended_NFW,
                                 analytical_vp=params.analytical_vp, analytical_rp=params.analytical_rp,
                                 vr1=params.vr1, vr2=params.vr2, vr3=params.vr3,
@@ -636,7 +655,8 @@ def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_
                                 Ncen_mean=Ncen_mean, Nsat_mean=Nsat_mean, vr_bin_edges=vr_bin_edges,
                                 vr_probs=vr_probs, vtan_bin_edges=vtan_bin_edges, vtan_probs=vtan_probs,
                                 r_bin_edges=r_bin_edges, probs_r=probs_r, Nsat_r=Nsat_r,
-                                K1_global=K1_global, K2_global=K2_global
+                                K1_global=K1_global, K2_global=K2_global,
+                                read_concentrations=params.read_concentrations
                                 )
 
                 # Write results to file

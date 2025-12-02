@@ -297,7 +297,7 @@ def plot_correlation_function(
         Index of the error column (if present).
     """
     # Load the data
-    data = np.loadtxt(filename, comments='#', delimiter=',')
+    data = np.loadtxt(filename, comments='#', delimiter=',', skiprows=1)
     r = data[:, r_index]
     xi = data[:, xi_index]
     # If there is a third column, treat as error bars
@@ -365,7 +365,7 @@ def plot_hod_occupation_from_mock(
     halo_id_col_mock: int = 14,
     is_central_col: int = 15,
     mass_col_halo: int = 6,
-    halo_id_col_halo: int = 7,
+    halo_id_col_halo: int = 9,
     logM_range: tuple = (10.5,14.5),
     show: bool = True
 ):

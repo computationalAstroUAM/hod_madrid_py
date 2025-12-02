@@ -8,7 +8,7 @@ Authors:       Joaquín Delgado Amar, Violeta González Pérez
 Supervisor:    Violeta González Pérez
 Institution:   Universidad Autónoma de Madrid (UAM)
 Created:       07 Jul 2025
-Last Updated:  26 Aug 2025
+Last Updated:  07 Oct 2025
 
 -------------------------------------------------------------------------------
 PURPOSE
@@ -38,7 +38,7 @@ MODES
 -------------------------------------------------------------------------------
 INPUTS
 -------------------------------------------------------------------------------
-1) Halo catalogue (ASCII): x, y, z, vx, vy, vz, logM, ID
+1) Halo catalogue (ASCII): x, y, z, vx, vy, vz, logM, concentration (optional), ID
 2) Optional external files from SAM (ASCII) for empirical models:
    - HOD shape tables
    - Radial distributions
@@ -103,7 +103,6 @@ References: Avila et al. (2020); Reyes Pedraza (2024); HODfit2sim documentation.
 ===============================================================================
 """
 
-
 from pathlib import Path
 import src.hod as hod
 import src.hod_io as io
@@ -130,8 +129,8 @@ LBOX = 1000.0                           # Box size in Mpc/h
 FTYPE = 'txt'                           # Possible input file type: txt
 OUTPUT_DIR = Path("output")
 INPUT_DIR = Path("data/example")
-INFILE = "/home2/guillermo/TFM_JOAQUIN/data/Halos_file_for_hod.txt"
-
+INFILE = "/home2/guillermo/TFM_JOAQUIN/data/Halos_file_for_hod_Rvir_Rs.txt"
+#INFILE = INPUT_DIR / "Halos_tree_x_y_z_vx_vy_vz_logM_Rvir_Rs_id_500000.txt"
 
 # =============================================================================
 # ======================= 2. AVERAGE HOD SHAPE ================================
@@ -155,13 +154,13 @@ GAMMA = -1.4                            # Power law slope for high mass centrals
 
 # If analytical_shape is False, a file should be given:
 HODFIT2SIM = True                       # Set to true if SAM was analyzed with HODFIT2SIM
-CONFORMITY = True                       # If true, use global conformity parameters for HOD shape
+CONFORMITY = False                      # If true, use global conformity parameters for HOD shape
 
 if HODFIT2SIM:
     # Output file from HODfit2sim
-    HOD_SHAPE_FILE = "/home2/guillermo/TFM_JOAQUIN/thesis/SAGE/h2s_output_shuffled.h5"  
+    HOD_SHAPE_FILE = "/home2/guillermo/TFM_JOAQUIN/catalogues/h2s_output_shuffled.h5"  
 else:
-    # .txt file with Mmin Mmax Ncen Nsat in mass bins should be given
+    # .txt file with  Mmax Ncen NsMminat in mass bins should be given
     HOD_SHAPE_FILE = "/home2/guillermo/TFM_JOAQUIN/thesis/mock_from_SAGE/HOD_shape_file.txt"
     # .txt file with K1_global K2_global should be given
     CONFORMITY_FILE = "/home2/guillermo/TFM_JOAQUIN/thesis/mock_from_SAGE/CONFORMITY_file.txt"
@@ -171,7 +170,18 @@ else:
 # ============ 3. Probability distribution function for satellites ============
 # =============================================================================
 
-BETA = 0.0                               # Poisson=0, Nearest integer=-2
+ANALYTICAL_PDF = True                    # If true, use analytical functions
+
+# For analytical PDF, the following parameters are needed:
+BETA = 0.0                             # Poisson=0, Nearest integer=-2
+
+# If analytical_pdf is False, a file should be given:
+if HODFIT2SIM:
+    # Output file from HODfit2sim
+    HOD_PDF_FILE = "/home2/guillermo/TFM_JOAQUIN/catalogues/h2s_output_shuffled.h5"
+else:
+    # .txt file with k N_halos_with_k_satellites should be given:
+    HOD_PDF_FILE = "/home2/guillermo/TFM_JOAQUIN/thesis/mock_from_SAGE/HOD_pdf_file.txt"
 
 
 # =============================================================================
@@ -181,21 +191,22 @@ BETA = 0.0                               # Poisson=0, Nearest integer=-2
 ANALYTICAL_RP = True                     # If true, use analytical functions
 
 # For analytical radial distribution, the following parameters are needed:
-K = 0.25                                 # NFW truncation parameter
-EXTENDED_NFW = True                      # If true, use extended NFW profile (Analytical)
+READ_CONCENTRATIONS = True               # If true, reads individual halo concentrations
+K = 0.6                                  # NFW truncation parameter (from 0 to 1)
+# If not using Klypin concentrations, individual halo concentrations will be read from the input file
 
-# If using extended NFW profile (analytical), the following parameters are needed:
-N0 = 3928.273                            # Normalization factor
-R0 = 0.34                                # Scale radius (Mpc/h)
-ALPHA_R = 1.23                           # Inner slope
-BETA_R = 3.19                            # Outer slope
-KAPPA_R = -2.1                           # Transition slope
+EXTENDED_NFW = False                     # If true, use extended NFW profile (Analytical)
+# If using extended NFW profile (Analytical), the following parameters are needed:
+N0 = 3899.85                             # Normalization factor
+R0 = 0.33874                             # Scale radius (Mpc/h)
+ALPHA_R = 1.23088                        # Inner slope
+BETA_R = 3.20228                         # Outer slope
+KAPPA_R = -2.08642                       # Transition slope
 
 # If analytical_rp is False, a file should be given:
-
 if HODFIT2SIM:
     # Output file from HODfit2sim
-    HOD_RP_FILE = "/home2/guillermo/TFM_JOAQUIN/thesis/SAGE/h2s_output_shuffled.h5"
+    HOD_RP_FILE = "/home2/guillermo/TFM_JOAQUIN/catalogues/h2s_output_shuffled.h5"
 else:
     # .txt file with rmin rmax Nsat Nsat/sum(Nsat) in radius bins should be given
     HOD_RP_FILE = "/home2/guillermo/TFM_JOAQUIN/thesis/mock_from_SAGE/HOD_rp_file.txt"
@@ -222,30 +233,30 @@ ANALYTICAL_VP = True                     # If true, use analytical functions
 VFACT = 1.0                              # Velocity factor (alpha_v)
 VT = 0.0                                 # Tangential velocity (km/s, =0 or =500)
 VTDISP = 0.0                             # Tangential velocity dispersion (km/s, =0 or =200)
-EXTENDED_VP = True                       # If true, use extended velocity profile (Analytical)
+EXTENDED_VP = False                      # If true, use extended velocity profile (Analytical)
 
 # If using extended velocity profile (analytical), the following parameters are needed:
 # Radial velocity profile (3-Gaussians)
-VR1 = -11954.702                         # Amplitude of first Gaussian
-VR2 = -11489.693                         # Amplitude of second Gaussian
-VR3 = -22660.605                         # Amplitude of third Gaussian
-MU1 = -333.368                           # Mean of first Gaussian
-MU2 = 266.023236                         # Mean of second Gaussian
-MU3 = -379                               # Mean of third Gaussian
-SIGMA1 = -127.831                        # Standard deviation of first Gaussian
-SIGMA2 = -242.559427                     # Standard deviation of second Gaussian
-SIGMA3 = -312.5                          # Standard deviation of third Gaussian
+VR1 = -10601.7                         # Amplitude of first Gaussian
+VR2 = -12038.5                         # Amplitude of second Gaussian
+VR3 = -22749.8                         # Amplitude of third Gaussian
+MU1 = -329.893                           # Mean of first Gaussian
+MU2 = 255.23                         # Mean of second Gaussian
+MU3 = -384.638                               # Mean of third Gaussian
+SIGMA1 = -123.386                        # Standard deviation of first Gaussian
+SIGMA2 = -246.083                     # Standard deviation of second Gaussian
+SIGMA3 = -277.454                         # Standard deviation of third Gaussian
 
 # Tangential velocity profile (Exponential * Power Law)
-V0_TAN = 123.033                          
-EPSILON_TAN = 0.8                       
-OMEGA_TAN =  -6.25e-4                    
-DELTA_TAN = 1.3                          
+V0_TAN = 2.66464                          
+EPSILON_TAN = 0.779307                       
+OMEGA_TAN =  -0.000445626                    
+DELTA_TAN = 1.35091                          
 
 # If analytical_vp is False, a file should be given:
 if HODFIT2SIM:
     # Output file from HODfit2sim
-    HOD_VP_FILE = "/home2/guillermo/TFM_JOAQUIN/thesis/SAGE/h2s_output_shuffled.h5"
+    HOD_VP_FILE = "/home2/guillermo/TFM_JOAQUIN/catalogues/h2s_output_shuffled.h5"
 else:
     # A .txt file with vr_min vr_max Nsat_vr vr_probs vtan_min vtan_max	Nsat_vtan vtan_probs should be given
     HOD_VP_FILE = "/home2/guillermo/TFM_JOAQUIN/thesis/mock_from_SAGE/HOD_vp_file.txt"
@@ -264,9 +275,9 @@ def main():
                                       HODfit2sim=HODFIT2SIM, conformity=CONFORMITY,
                                       hodshape=HODSHAPE, mu=MU, Ac=AC, As=AS,
                                       M0=M0, M1=M1, alpha=ALPHA, sig=SIG, gamma=GAMMA,
-                                      beta=BETA,
-                                      analytical_rp=ANALYTICAL_RP,
-                                      hod_rp_file=HOD_RP_FILE,K=K, extended_NFW=EXTENDED_NFW,
+                                      analytical_pdf=ANALYTICAL_PDF, beta=BETA, hod_pdf_file=HOD_PDF_FILE,
+                                      analytical_rp=ANALYTICAL_RP, read_concentrations=READ_CONCENTRATIONS,
+                                      hod_rp_file=HOD_RP_FILE, K=K, extended_NFW=EXTENDED_NFW,
                                       N0 = N0, r0=R0, alpha_r=ALPHA_R, beta_r=BETA_R, kappa_r=KAPPA_R,
                                       analytical_vp=ANALYTICAL_VP,
                                       hod_vp_file=HOD_VP_FILE,
@@ -290,26 +301,10 @@ def main():
         if TEST_PLOTS:
             result = plots.make_test_plots(hod_params,OUTPUT_DIR,
                                      verbose=VERBOSE)
-            
-            """
-            vr_bin_edges, vr_probs, vtan_bin_edges, vtan_probs = load_velocity_histograms_from_h5_not_normalized(HOD_SHAPE_FILE)
-            plot_velocity_distribution_mock(
-                mock_file= hod_params.outfile,
-                n_bins=200,
-                output_dir="output",
-                show=True,
-                vr_input_bins=vr_bin_edges,
-                vr_input_pdf=vr_probs,
-                vtan_input_bins=vtan_bin_edges,
-                vtan_input_pdf=vtan_probs
-            )
-            """
         if TEST_2PCF:
-            
             positions_file = OUTPUT_DIR / "galaxy_positions.txt"
             corr.extract_positions_from_galaxy_catalog(
                 hod_params.outfile, positions_file)
-            
             xi_output_file = OUTPUT_DIR / "corrfunc_xi.txt"
             corr.compute_correlation_corrfunc(
                 positions_file=str(positions_file),
@@ -318,17 +313,16 @@ def main():
                 rmin=1.4e-3,     
                 rmax=140.0,
                 n_bins=80,
+                binning='log',
                 n_threads=4,
                 verbose=VERBOSE
             )
-            
             plots.plot_correlation_function(
                 filename=str(xi_output_file),
                 output_png=str(OUTPUT_DIR / "corrfunc_xi.png"),
                 loglog=True,
                 show=True
             )
-
         if TEST_2PCF_RS:
             positions_file_rs = OUTPUT_DIR / "galaxy_positions_rs.txt"
             corr.extract_positions_from_galaxy_catalog_rs(
@@ -343,7 +337,6 @@ def main():
                 los_axis=AXIS_RS,
                 verbose=VERBOSE
             )
-
             xi_output_file_rs = OUTPUT_DIR / "corrfunc_xi_rs.txt"
             corr.compute_correlation_corrfunc(
                 positions_file=str(positions_file_rs),
@@ -352,17 +345,16 @@ def main():
                 rmin=1.4e-3,
                 rmax=140.0,
                 n_bins=80,
+                binning='log',
                 n_threads=4,
                 verbose=VERBOSE
             )
-
             plots.plot_correlation_function(
                 filename=str(xi_output_file_rs),
                 output_png=str(OUTPUT_DIR / "corrfunc_xi_rs.png"),
                 loglog=True,
                 show=True
             )
-
         if TEST_HOD_OCCUPATION:
             plots.plot_hod_occupation_from_mock(
                 mock_file=hod_params.outfile,
@@ -370,7 +362,6 @@ def main():
                 output_png=str(OUTPUT_DIR / "hod_occupation_mock.png"),
                 n_bins=200,
                 show=True)
-
 
     return result
 

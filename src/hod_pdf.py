@@ -36,6 +36,47 @@ def factorial_float(f):
         result *= float(i)
     return result
 
+
+@jit(nopython=True)
+def poisson_pdf(lam, k):
+    """
+    Calculate the Poisson probability distribution function.
+    
+    Parameters
+    ----------
+    k : int
+        Number of occurrences (must be non-negative)
+    lam : float
+        Mean (lambda, must be positive)
+    
+    Returns
+    -------
+    float
+        Probability P(X = k) for the Poisson PDF
+    """
+    if k < 0 or lam <= 0:
+        return 0.0
+    
+    return math.pow(lam, k) * math.exp(-lam) / factorial_float(k)
+
+'''
+@jit(nopython=True)
+def poisson_sample(lam):
+    """Sample from a Poisson PDF"""
+    k = 0
+    prob = 0.0
+    r = np.random.random()
+    
+    while prob < 0.999999999999999:
+        prob += poisson_pdf(lam, k)
+        if r < prob:
+            return k
+        k += 1
+        if k > c.chunk_size:  # Safety break to prevent infinite loops
+            break
+    
+    return k
+'''
 @jit(nopython=True)
 def poisson_sample(lam):
     """Sample from Poisson distribution"""
@@ -53,6 +94,7 @@ def poisson_sample(lam):
     
     return k
 
+
 @jit(nopython=True)
 def next_integer(x):
     """Sample integer based on fractional part - direct translation from C"""
@@ -64,8 +106,9 @@ def next_integer(x):
     else:
         return low + 1
 
+    
 @jit(nopython=True)
-def product(a, b):
+def product_gamma(a, b):
     """Calculate product from b to a-1 (avoiding gamma function overflow)"""    
     c = int(round(a - b))
     s = 1.0
@@ -75,25 +118,66 @@ def product(a, b):
 
 
 @jit(nopython=True)
-def neg_binomial_sample(x, beta):
+def neg_binomial_pdf(lam, k, beta):
+    """
+    Calculate the Negative Binomial probability distribution function.
+    
+    Parameters
+    ----------
+    k : int
+        Number of failures (must be non-negative)
+    beta : float
+        Dispersion parameter
+    
+    Returns
+    -------
+    float
+        Probability P(X = k) for Negative Binomial PDF
+    """
+    if k < 0:
+        return 0.0
+    
+    q = 1.0 / beta
+    p = q / (q + lam)
+    
+    # Use product function to avoid gamma function overflow
+    prob = (product_gamma(k + q - 1, q) / factorial_float(k) * 
+            math.pow(p, q) * math.pow(1 - p, k))
+    
+    return prob
+
+'''
+@jit(nopython=True)
+def neg_binomial_pdf2(lam, k, beta):
+    """Negative Binomial PDF using log-gamma to avoid overflow."""
+    if k < 0 or beta <= 0:
+        return 0.0
+    q = 1.0 / beta
+    p = 1.0 / (1.0 + beta * lam)
+
+    # log(P) = log Γ(k+r) - log Γ(r) - log k! + r log p + k log(1-p)
+    logP = math.lgamma(k + q) - math.lgamma(q) - math.lgamma(k + 1) \
+           + q * math.log(p) + k * math.log(1 - p)
+
+    return math.exp(logP)
+'''
+
+
+@jit(nopython=True)
+def neg_binomial_sample(lam, beta):
     """Sample from negative binomial distribution"""
-    r = 1.0 / beta  
-    p = r / (r + x)
     P = 0.0
-    N = -1
+    k = -1
     rand01 = np.random.random()
     
     while P < rand01:
-        N += 1
-        # Use product function to avoid gamma function overflow
-        prob_term = (product(N + r - 1, r) / factorial_float(N) * 
-                    math.pow(p, r) * math.pow(1 - p, N))
+        k += 1
+        prob_term = neg_binomial_pdf(lam, k, beta)
         P += prob_term
         
-        if N > c.chunk_size:  # Safety break
+        if k > c.chunk_size:  # Safety break
             break
-    
-    return N
+    return k
 
 
 @jit(nopython=True)

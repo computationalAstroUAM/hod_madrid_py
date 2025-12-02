@@ -1,56 +1,132 @@
 import numpy as np
 from numba import jit
 import math
-
 import src.hod_io as io
 from src.hod_cosmology import Delta_vir, E2
 from src.hod_pdf import rand_gauss
 import h5py
 
 @jit(nopython=True)
-def generate_virial_velocity(M, zsnap, omega_M):
-    """Generate velocity dispersion within halo"""
+def generate_virial_velocity(M: float, zsnap: float, omega_M: float):
+    """
+    Draw a 3D random velocity (Dvx, Dvy, Dvz) consistent with a virial dispersion.
+
+    The velocity dispersion is modeled as
+        sigma_1D = 476 * 0.9 * [Δ_vir(z) * E(z)^2]^(1/6) * (M / 1e15)^(1/3)  [km/s]
+    and each component is sampled as a Gaussian deviate with std = sigma_1D.
+
+    Parameters
+    ----------
+    M : float
+        Halo mass in Msun/h (linear, not log10).
+    zsnap : float
+        Snapshot redshift.
+    omega_M : float
+        Present-day matter density parameter Ω_M(0).
+
+    Returns
+    -------
+    (Dvx, Dvy, Dvz) : tuple of floats
+        Velocity components in km/s drawn from N(0, sigma_1D^2).
+
+    Notes
+    -----
+    - Δ_vir(z) is the virial overdensity (Bryan & Norman 1998).
+    - E(z)^2 = Ω_M(1+z)^3 + Ω_Λ (flat ΛCDM, with Ω_Λ=1-Ω_M).
+    - The mass scaling ∝ M^(1/3) and the weak redshift dependence via
+      [Δ_vir E^2]^(1/6) are typical of virial arguments.
+    - `rand_gauss()` must return a standard normal deviate (mean 0, std 1).
+    """
     Delta_vir_val = Delta_vir(zsnap, omega_M)
     E2_val = E2(zsnap, omega_M)
-    
-    sigma = 476 * 0.9 * math.pow(Delta_vir_val * E2_val,1.0/6.0) *\
-        math.pow(M / 1.0e15,1.0/3.0)
-    
+
+    sigma = (
+        476.0
+        * 0.9
+        * math.pow(Delta_vir_val * E2_val, 1.0 / 6.0)
+        * math.pow(M / 1.0e15, 1.0 / 3.0)
+    )
+
     Dvx = sigma * rand_gauss()
     Dvy = sigma * rand_gauss()
     Dvz = sigma * rand_gauss()
-    
     return Dvx, Dvy, Dvz
 
 
-def load_velocity_histograms_from_h5(h5file):
+def load_velocity_histograms_from_h5(h5file: str):
     """
-    Reads satellite velocity histograms from h2s_output.h5 file.
+    Load satellite velocity histograms from an HDF5 produced by h2s.
 
-    Returns:
-        - vr_bin_edges: array of bin edges for v_rad
-        - vr_probs: probabilities per bin for v_rad (normalized)
-        - vtan_bin_edges: array of bin edges for |v_tan|
-        - vtan_probs: probabilities per bin for |v_tan| (normalized)
+    The file is expected to contain, under the group 'data', the per-bin min/max
+    edges and counts for:
+      - radial velocity v_r  (datasets: 'vr_min', 'vr_max', 'Nsat_vr')
+      - tangential speed |v_tan| (datasets: 'vtan_min', 'vtan_max', 'Nsat_vtan')
+
+    This helper reconstructs the **bin edges** and returns **normalized PDFs**.
+
+    Parameters
+    ----------
+    h5file : str
+        Path to the HDF5 file (e.g., 'h2s_output.h5').
+
+    Returns
+    -------
+    vr_bin_edges : ndarray, shape (n_vr_bins + 1,)
+        Monotonic edges for the v_r histogram.
+    vr_probs : ndarray, shape (n_vr_bins,)
+        Bin probabilities for v_r (sum to 1.0).
+    vtan_bin_edges : ndarray, shape (n_vtan_bins + 1,)
+        Monotonic edges for the |v_tan| histogram.
+    vtan_probs : ndarray, shape (n_vtan_bins,)
+        Bin probabilities for |v_tan| (sum to 1.0).
+
+    Notes
+    -----
+    - The input is assumed to store **counts per bin** (Nsat_vr, Nsat_vtan). We
+      normalize by the total count to obtain probabilities.
+    - Units are those of the input file (typically km/s). This function does not
+      rescale units.
+    - If a histogram has zero total counts, the corresponding probability array
+      is returned as zeros to avoid division-by-zero.
+
+    Examples
+    --------
+    >>> vr_edges, vr_p, vt_edges, vt_p = load_velocity_histograms_from_h5("h2s_output.h5")
+    >>> # Sample a radial velocity bin index:
+    >>> idx = np.random.choice(len(vr_p), p=vr_p)
     """
     with h5py.File(h5file, 'r') as f:
         data = f['data']
         # Radial velocities
-        vr_min = np.array(data['vr_min'])  # shape (n_bins,)
-        vr_max = np.array(data['vr_max'])  # shape (n_bins,)
-        Nsat_vr = np.array(data['Nsat_vr']).astype(float)
-        # Tangential velocities
-        vtan_min = np.array(data['vtan_min'])
-        vtan_max = np.array(data['vtan_max'])
-        Nsat_vtan = np.array(data['Nsat_vtan']).astype(float)
+        vr_min = np.asarray(data['vr_min'])
+        vr_max = np.asarray(data['vr_max'])
+        Nsat_vr = np.asarray(data['Nsat_vr'], dtype=float)
 
-    # Construct bin edges
+        # Tangential speeds (absolute value)
+        vtan_min = np.asarray(data['vtan_min'])
+        vtan_max = np.asarray(data['vtan_max'])
+        Nsat_vtan = np.asarray(data['Nsat_vtan'], dtype=float)
+
+    # Construct edges: last edge is the last bin's max
+    if vr_min.size == 0 or vtan_min.size == 0:
+        raise ValueError("Velocity histogram datasets are empty in the HDF5 file.")
+
     vr_bin_edges = np.concatenate([vr_min, [vr_max[-1]]])
     vtan_bin_edges = np.concatenate([vtan_min, [vtan_max[-1]]])
 
-    # Normalize to get probabilities
-    vr_probs = Nsat_vr / np.sum(Nsat_vr)
-    vtan_probs = Nsat_vtan / np.sum(Nsat_vtan)
+    # Normalize counts → probabilities (safe handling for 0 totals)
+    vr_total = Nsat_vr.sum()
+    vtan_total = Nsat_vtan.sum()
+
+    if vr_total > 0:
+        vr_probs = Nsat_vr / vr_total
+    else:
+        vr_probs = np.zeros_like(Nsat_vr, dtype=float)
+
+    if vtan_total > 0:
+        vtan_probs = Nsat_vtan / vtan_total
+    else:
+        vtan_probs = np.zeros_like(Nsat_vtan, dtype=float)
 
     return vr_bin_edges, vr_probs, vtan_bin_edges, vtan_probs
 

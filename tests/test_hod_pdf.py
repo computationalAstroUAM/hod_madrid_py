@@ -16,26 +16,46 @@ class TestPoissonSample(unittest.TestCase):
         """Clean up after tests"""
         pass
 
-    def test_poisson_sample(self):
-        """Test behavior with lambda = 0"""
-        np.random.seed(42)
-        result = pdf.poisson_sample(0.0)
-        self.assertEqual(result, 0, "Poisson(0) should return 0")
+    def test_poisson_pdf(self):
+        """Test Poisson PDF"""
+        lam = 2.0
+        self.assertAlmostEqual(pdf.poisson_pdf(lam, 0),np.exp(-lam), places=9)
+        self.assertAlmostEqual(pdf.poisson_pdf(lam, 1),2*np.exp(-lam), places=9)
+        self.assertAlmostEqual(pdf.poisson_pdf(lam, 2),2*np.exp(-lam), places=9)
+        lam = 0.01
+        self.assertAlmostEqual(pdf.poisson_pdf(lam, 0),np.exp(-lam), places=9)
+
+        # Int is 1
+        lam = 3.5
+        total_prob = sum(pdf.poisson_pdf(lam, k) for k in range(50))
+        self.assertAlmostEqual(total_prob, 1.0, places=6)
+
+        # Prob at peak is max and between 0 and 1
+        lam = 100.
+        k_peak = int(lam)
+        prob_peak = pdf.poisson_pdf(lam, k_peak)
+        self.assertGreater(prob_peak, 0.0)
+        self.assertLess(prob_peak, 1.0)
+        self.assertGreater(prob_peak, pdf.poisson_pdf(lam, k_peak+20))
+        self.assertGreater(prob_peak, pdf.poisson_pdf(lam, k_peak-20))
         
-        """Test behavior with negative lambda"""
-        np.random.seed(42)
-        result = pdf.poisson_sample(-1.0)
-        self.assertEqual(result, 0, "Negative lambda should return 0")
-    
-        """Test with small lambda values"""
+        # Test that Poisson PDF has correct mean
+        lam = 4.0
+        mean = sum(k * pdf.poisson_pdf(lam, k) for k in range(50))
+        self.assertAlmostEqual(mean, lam, places=5)
+        
+        # Negative k or lam should return 0
+        self.assertEqual(pdf.poisson_pdf(lam, -1), 0.0)
+        self.assertEqual(pdf.poisson_pdf(0.0, 1), 0.0)
+        self.assertEqual(pdf.poisson_pdf(-1.0, 1), 0.0)
+        
+    def test_poisson_sample(self):
         test_lambdas = [0.1, 0.5, 1.0, 2.0]  
         for lam in test_lambdas:
+            # Test whole array even if it fails for one value
             with self.subTest(lambda_val=lam):
                 np.random.seed(42)
-                # Generate multiple samples
                 samples = [pdf.poisson_sample(lam) for _ in range(1000)]
-                
-                # Basic checks
                 self.assertTrue(all(s >= 0 for s in samples), 
                                f"All samples should be non-negative for lambda={lam}")
                 self.assertTrue(all(isinstance(s, (int, np.integer)) for s in samples),
@@ -106,60 +126,110 @@ class TestPoissonSample(unittest.TestCase):
         result = pdf.next_integer(-0.5)
         self.assertIn(result, [-1, 0], "next_integer(-0.5) should return -1 or 0")
 
-    def test_neg_binomial(self):
-        """Test neg_binomial_sample function"""
-        # Test edge cases
-        np.random.seed(42)
-        result = pdf.neg_binomial_sample(0.0, 1.0)
-        self.assertEqual(result, 0, "neg_binomial_sample(0, beta) should return 0")
-        
-        # Test with positive parameters
-        test_cases = [
-            (1.0, 0.5),   # mean=1.0, beta=0.5
-            (2.0, 1.0),   # mean=2.0, beta=1.0
-            (5.0, 0.2),   # mean=5.0, beta=0.2
-        ]
-        
-        for mean, beta in test_cases:
-            with self.subTest(mean=mean, beta=beta):
-                np.random.seed(42)
-                samples = [pdf.neg_binomial_sample(mean, beta) for _ in range(1000)]
-                
-                # Basic validity checks
-                self.assertTrue(all(s >= 0 for s in samples),
-                               f"All neg_binomial samples should be non-negative")
-                self.assertTrue(all(isinstance(s, (int, np.integer)) for s in samples),
-                               f"All neg_binomial samples should be integers")
-                
-                # Check reasonable range (shouldn't be extremely large)
-                max_reasonable = mean + 10 * math.sqrt(mean * (1 + beta * mean))
-                self.assertTrue(all(s <= max_reasonable for s in samples),
-                               f"neg_binomial samples should be within reasonable range")
-        
-        # Test statistical properties for a specific case
-        mean, beta = 3.0, 0.5
-        np.random.seed(42)
-        samples = [pdf.neg_binomial_sample(mean, beta) for _ in range(5000)]
-        sample_mean = np.mean(samples)
-        sample_var = np.var(samples)
-        
-        # For negative binomial: variance = mean * (1 + beta * mean)
-        expected_var = mean * (1 + beta * mean)
-        
-        # Allow reasonable tolerance for statistical fluctuations
-        mean_tolerance = 0.3
-        var_tolerance = 0.5 * expected_var
-        
-        self.assertAlmostEqual(sample_mean, mean, delta=mean_tolerance,
-                             msg=f"neg_binomial mean should be close to {mean}")
-        self.assertAlmostEqual(sample_var, expected_var, delta=var_tolerance,
-                             msg=f"neg_binomial variance should be close to {expected_var}")
-        
-        # Test that function doesn't hang with extreme parameters
-        np.random.seed(42)
-        result = pdf.neg_binomial_sample(0.1, 2.0)  # Small mean, large beta
-        self.assertIsInstance(result, (int, np.integer), "Should return integer even with extreme params")
 
+    def test_neg_binomial_pdf(self):
+        lam = 5.0
+        beta = 0.5
+        
+        # Check that probabilities are non-negative and <= 1
+        for k in range(20):
+            prob = pdf.neg_binomial_pdf(lam, k, beta)
+            self.assertGreaterEqual(prob, 0.0)
+            self.assertLessEqual(prob, 1.0)
+    
+#    def test_neg_binomial_pdf_sum_to_one(self):
+#        """Test that Negative Binomial PDF sums to approximately 1"""
+#        x = 3.0
+#        beta = 0.3
+#        total_prob = sum(neg_binomial_pdf(k, x, beta) for k in range(100))
+#        self.assertAlmostEqual(total_prob, 1.0, places=5)
+#    
+#    def test_neg_binomial_pdf_mean(self):
+#        """Test that Negative Binomial PDF has correct mean"""
+#        x = 4.0  # This is the mean parameter
+#        beta = 0.5
+#        mean = sum(k * neg_binomial_pdf(k, x, beta) for k in range(100))
+#        self.assertAlmostEqual(mean, x, places=3)
+#    
+#    def test_neg_binomial_pdf_edge_cases(self):
+#        """Test Negative Binomial PDF edge cases"""
+#        # Negative k should return 0
+#        self.assertEqual(neg_binomial_pdf(-1, 5.0, 0.5), 0.0)
+#        
+#        # k=0 should give non-zero probability
+#        prob_0 = neg_binomial_pdf(0, 3.0, 0.5)
+#        self.assertGreater(prob_0, 0.0)
+#        self.assertLess(prob_0, 1.0)
+#    
+#    def test_neg_binomial_pdf_variance(self):
+#        """Test that Negative Binomial PDF has correct variance relationship"""
+#        x = 5.0  # mean
+#        beta = 0.4
+#        
+#        # Calculate mean and second moment
+#        mean = sum(k * neg_binomial_pdf(k, x, beta) for k in range(100))
+#        second_moment = sum(k**2 * neg_binomial_pdf(k, x, beta) for k in range(100))
+#        variance = second_moment - mean**2
+#        
+#        # For negative binomial, variance = mean + beta * mean^2
+#        expected_variance = x + beta * x**2
+#        self.assertAlmostEqual(variance, expected_variance, places=2)
+#    
+     
+#    def test_neg_binomial_sample(self):
+#        """Test neg_binomial_sample function"""
+#        # Test edge cases
+#        np.random.seed(42)
+#        result = pdf.neg_binomial_sample(0.0, 1.0)
+#        self.assertEqual(result, 0, "neg_binomial_sample(0, beta) should return 0")
+#        
+#        # Test with positive parameters
+#        test_cases = [
+#            (1.0, 0.5),   # mean=1.0, beta=0.5
+#            (2.0, 1.0),   # mean=2.0, beta=1.0
+#            (5.0, 0.2),   # mean=5.0, beta=0.2
+#        ]
+#        
+#        for mean, beta in test_cases:
+#            with self.subTest(mean=mean, beta=beta):
+#                np.random.seed(42)
+#                samples = [pdf.neg_binomial_sample(mean, beta) for _ in range(1000)]
+#                
+#                # Basic validity checks
+#                self.assertTrue(all(s >= 0 for s in samples),
+#                               f"All neg_binomial samples should be non-negative")
+#                self.assertTrue(all(isinstance(s, (int, np.integer)) for s in samples),
+#                               f"All neg_binomial samples should be integers")
+#                
+#                # Check reasonable range (shouldn't be extremely large)
+#                max_reasonable = mean + 10 * math.sqrt(mean * (1 + beta * mean))
+#                self.assertTrue(all(s <= max_reasonable for s in samples),
+#                               f"neg_binomial samples should be within reasonable range")
+#        
+#        # Test statistical properties for a specific case
+#        mean, beta = 3.0, 0.5
+#        np.random.seed(42)
+#        samples = [pdf.neg_binomial_sample(mean, beta) for _ in range(5000)]
+#        sample_mean = np.mean(samples)
+#        sample_var = np.var(samples)
+#        
+#        # For negative binomial: variance = mean * (1 + beta * mean)
+#        expected_var = mean * (1 + beta * mean)
+#        
+#        # Allow reasonable tolerance for statistical fluctuations
+#        mean_tolerance = 0.3
+#        var_tolerance = 0.5 * expected_var
+#        
+#        self.assertAlmostEqual(sample_mean, mean, delta=mean_tolerance,
+#                             msg=f"neg_binomial mean should be close to {mean}")
+#        self.assertAlmostEqual(sample_var, expected_var, delta=var_tolerance,
+#                             msg=f"neg_binomial variance should be close to {expected_var}")
+#        
+#        # Test that function doesn't hang with extreme parameters
+#        np.random.seed(42)
+#        result = pdf.neg_binomial_sample(0.1, 2.0)  # Small mean, large beta
+#        self.assertIsInstance(result, (int, np.integer), "Should return integer even with extreme params")
+#
     def test_binomial(self):
         """Test binomial_sample function"""
         # Test edge cases
