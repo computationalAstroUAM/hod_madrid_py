@@ -1,26 +1,79 @@
+# hod.py
+
 """
-Run all the parts of an HOD model 
+Main execution engine for HOD-based mock-galaxy generation.
+
+Overview
+--------
+This module coordinates the full construction of a mock galaxy catalogue from
+an input halo catalogue. It connects the different physical components of the
+pipeline:
+
+- halo occupation statistics,
+- satellite radial placement,
+- satellite velocity assignment,
+- optional conformity corrections,
+- optional derivation of analytical amplitudes and characteristic mass scale,
+- chunk-wise I/O for large catalogues.
+
+Architecture
+------------
+The workflow is organized in three layers:
+
+1. Per-halo realization
+   For each halo, the code decides whether it hosts a central galaxy and how
+   many satellites it contains, then assigns positions and velocities to all
+   galaxies associated with that halo.
+
+2. Per-chunk processing
+   Haloes are read in chunks from the input catalogue in order to control
+   memory usage and allow large-volume processing.
+
+3. Full-run orchestration
+   The top-level driver loads the required auxiliary inputs, validates the
+   configuration, optionally derives analytical HOD parameters, and launches
+   the chunk-wise realization of the full mock.
+
+Conventions
+-----------
+- Halo masses are handled internally both in linear form 'M' and logarithmic
+  form 'logM', depending on the requirements of each submodule.
+- Positions are expressed in comoving Mpc/h.
+- Velocities are expressed in km/s.
+- Galaxy catalogues are written in the internal 16-column format adopted by
+  the repository.
 """
 import numpy as np
 from numba import jit
 import time
+import src.hod_madrid_py.hod_amplitudes as amp
 
-import src.hod_io as io
-import src.hod_const as c
-import src.hod_r_profile as rp
-import src.hod_v_profile as vp
-import src.hod_shape as shape
-import src.hod_pdf as pdf
-import src.hod_cosmology as cosm
+class Timer:
+    def __init__(self):
+        self.t0 = time.perf_counter()
+
+    def lap(self):
+        t = time.perf_counter()
+        dt = t - self.t0
+        self.t0 = t
+        return dt
+
+import src.hod_madrid_py.hod_io as io
+import src.hod_madrid_py.hod_const as c
+import src.hod_madrid_py.hod_r_profile as rp
+import src.hod_madrid_py.hod_v_profile as vp
+import src.hod_madrid_py.hod_shape as shape
+import src.hod_madrid_py.hod_pdf as pdf
+import src.hod_madrid_py.hod_cosmology as cosm
 
 def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, random_seeds,
                         hodshape, mu, Ac, As,alpha, sig, gamma, vfact, beta,
                         K, vt, vtdisp, M0, M1, omega_M, Lbox, zsnap,
-                        alpha_r, beta_r, N0, r0, kappa_r, extended_NFW = True,
+                        alpha_r, beta_r, N0, r0, Rmax, kappa_r, extended_NFW = True,
                         vr1=None, vr2=None, vr3=None, mu1=None, mu2=None, mu3=None,
                         sigma1=None, sigma2=None, sigma3=None, extended_vp=True,
                         v0_tan=None, epsilon_tan=None, omega_tan=None, delta_tan=None,
-                        read_concentrations=False, analytical_pdf=False):
+                        read_concentrations=False, conformity=False, K1_global=1.0, K2_global=1.0):
     
     """
     Generate central and satellite galaxies for a chunk of halos using an 
@@ -91,10 +144,6 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids
             [11-13]: position offsets Dx, Dy, Dz
             [14]   : host halo ID
             [15]   : is_central flag (1 = central, 0 = satellite)
-            [16]   : halo concentration
-            [17]   : halo Rvir
-            [18]   : halo Rs
-
     Notes
     -----
     - Satellite positions are sampled isotropically.
@@ -103,6 +152,13 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids
     """
 
     n_halos = len(x)
+    t_occ = 0.0
+    t_cen = 0.0
+    t_rp  = 0.0
+    t_vp  = 0.0
+    t_sat_write = 0.0
+    t_over = 0.0
+    t_norm = 0.0
     
     # Start with a reasonable initial estimate but allow growth
     initial_estimate = n_halos * 50 
@@ -112,7 +168,19 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids
     galaxies = np.zeros((max_galaxies, 16))
     galaxy_count = 0
     
+    t0 = time.perf_counter()
+    occ_rng = np.random.default_rng(int(random_seeds[0]))
+    Ncen_arr, Nsat_arr, has_gal = shape.compute_hod_arrays(logM,mu, Ac, As, alpha, sig, gamma,M0, M1, hodshape, beta, conformity, K1_global, K2_global, occ_rng)
+    t_occ = time.perf_counter() - t0 
+
+    t_loop_start = time.perf_counter()
     for i in range(n_halos):
+        if has_gal[i] == 0:
+            continue
+        
+        # Set random seed for this halo
+        rng_halo = np.random.default_rng(int(random_seeds[i]))
+
         # Extract halo properties
         halo_x, halo_y, halo_z = x[i], y[i], z[i]
         halo_vx, halo_vy, halo_vz = vx[i], vy[i], vz[i]
@@ -120,16 +188,10 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids
         halo_Rvir = Rvir[i]
         halo_Rs = Rs[i]
         halo_id = halo_ids[i]
-        
-        # Set random seed for this halo
-        rng_halo = np.random.default_rng(int(random_seeds[i]))
-        
-        # Convert to linear mass
         M = 10.0**halo_logM
+        Ncen = Ncen_arr[i]
+        Nsat = Nsat_arr[i]
 
-        # Generate central and satellite counts
-        Ncen, Nsat = shape.calculate_hod_occupation(M, mu, Ac, As, alpha,
-                                                    sig, gamma, M0, M1, hodshape, beta)
         # Check if we need to grow the array before processing this halo
         galaxies_needed = Ncen + Nsat
         if galaxy_count + galaxies_needed >= max_galaxies:
@@ -143,6 +205,7 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids
         
         # Write central galaxy if present
         if Ncen == 1:
+            t0 = time.perf_counter()
             if galaxy_count >= max_galaxies:
                 # Grow array
                 new_size = int(max(max_galaxies * 2, galaxy_count + 1000))
@@ -169,6 +232,7 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids
             galaxies[galaxy_count, 15] = 1.0       # is_central == 1
             galaxy_count += 1
 
+            t_cen += time.perf_counter() - t0
         # Generate satellite galaxies
         for j in range(Nsat):
             if galaxy_count >= max_galaxies:
@@ -181,21 +245,31 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids
 
             # Generate position and velocity offsets
             if extended_NFW == True:
-                Dx, Dy, Dz = rp.generate_extended_position(M, zsnap, omega_M, c.rho_crit, cosm.Delta_vir, K, r0, alpha_r, beta_r, kappa_r, N0, rng=rng_halo)
+                t0 = time.perf_counter()
+                Dx, Dy, Dz = rp.generate_extended_position(M, zsnap, omega_M, c.rho_crit, cosm.Delta_vir, halo_Rvir, Rmax, r0, alpha_r, beta_r, kappa_r, N0, rng=rng_halo)
+                t_rp += time.perf_counter() - t0
             else:
-                if read_concentrations:
-                    Dx, Dy, Dz = rp.generate_nfw_position_from_c(Rvir=halo_Rvir, Rs=halo_Rs)
-                else:
-                    Dx, Dy, Dz = rp.generate_nfw_position(M=M, zsnap=zsnap, omega_M=omega_M, K=K)
+                t0 = time.perf_counter()
+                Rvir_use = rp.get_effective_Rvir(M, zsnap, omega_M, halo_Rvir)
+                c_eff = rp.get_effective_concentration(M=M,zsnap=zsnap,Rvir=Rvir_use,Rs=halo_Rs,K=K,read_concentrations=read_concentrations)
+                Dx, Dy, Dz = rp.generate_nfw_position_from_concentration(Rvir=Rvir_use,c_eff=c_eff,rng=rng_halo)
+                t_rp += time.perf_counter() - t0
 
             if extended_vp == True:
-                 r_hat = np.array([Dx, Dy, Dz])
-                 r_hat /= np.linalg.norm(r_hat)
+                t0 = time.perf_counter()
+                r_hat = np.array([Dx, Dy, Dz])
+                r_hat /= np.linalg.norm(r_hat)
+                t_norm += time.perf_counter() - t0
 
-                 Dvx, Dvy, Dvz = vp.sample_velocity_analytic(r_hat, vr1, vr2, vr3, mu1, mu2, mu3, sigma1, sigma2, sigma3, v0_tan, epsilon_tan, omega_tan, delta_tan, vtan_min=0.0, vtan_max=2000.0, rng=rng_halo)
+                t0 = time.perf_counter()
+                Dvx, Dvy, Dvz = vp.sample_velocity_analytic(r_hat, vr1, vr2, vr3, mu1, mu2, mu3, sigma1, sigma2, sigma3, v0_tan, epsilon_tan, omega_tan, delta_tan, vtan_min=0.0, vtan_max=2000.0, rng=rng_halo)
+                t_vp += time.perf_counter() - t0
             else:
-                Dvx, Dvy, Dvz = vp.generate_virial_velocity(M, zsnap, omega_M)
+                t0 = time.perf_counter()
+                Dvx, Dvy, Dvz = vp.generate_virial_velocity(M, zsnap, omega_M, rng=rng_halo)
+                t_vp += time.perf_counter() - t0
 
+            t0 = time.perf_counter()
             # Apply periodic boundary conditions
             xgal = (halo_x + Dx) % Lbox
             ygal = (halo_y + Dy) % Lbox
@@ -219,13 +293,30 @@ def process_halos_chunk_analytical(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids
             galaxies[galaxy_count, 14] = halo_id
             galaxies[galaxy_count, 15] = 0.0        # is_central == 0
             galaxy_count += 1
+            t_sat_write += time.perf_counter() - t0
+    t_over = time.perf_counter() - t_loop_start
     
+    overhead = t_over - (t_occ + t_cen + t_rp + t_norm + t_vp + t_sat_write)
+
+    print(
+        f"[analytical internal] "
+        f"occ={t_occ:.3f}s | "
+        f"cen={t_cen:.3f}s | "
+        f"rp={t_rp:.3f}s | "
+        f"norm={t_norm:.3f}s | "
+        f"vp={t_vp:.3f}s | "
+        f"write_sat={t_sat_write:.3f}s | "
+        f"overhead={overhead:.3f}s | "
+        f"loop_total={t_over:.3f}s"
+    )
+
+
     # Return only the filled portion of the array
     return galaxies[:galaxy_count, :]
 
 def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, random_seeds,
                         vfact, beta, K, vt, vtdisp, omega_M, Lbox, zsnap,
-                        alpha_r, beta_r, N0, r0, kappa_r, extended_NFW = True,
+                        alpha_r, beta_r, N0, r0, Rmax, kappa_r, extended_NFW = True,
                         analytical_vp = None, analytical_rp = None,
                         conformity = False, M_min = None, M_max = None, Ncen_mean = None, Nsat_mean = None,
                         vr_bin_edges = None, vr_probs = None, vtan_bin_edges = None, vtan_probs = None,
@@ -233,7 +324,7 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, rand
                         vr1=None, vr2=None, vr3=None, mu1=None, mu2=None, mu3=None,
                         sigma1=None, sigma2=None, sigma3=None, extended_vp=True,
                         v0_tan=None, epsilon_tan=None, omega_tan=None, delta_tan=None,
-                        read_concentrations=False, analytical_pdf=False):
+                        read_concentrations=False):
     
     """
     Generate central and satellite galaxies for a chunk of halos using 
@@ -337,7 +428,9 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, rand
     - Randomness is controlled by `random_seeds` to ensure reproducibility.
     - Both radial and velocity distributions can be chosen analytically or empirically.
     """
-
+    t_occ = 0.0     # ocupación (Ncen / Nsat)
+    t_rp = 0.0      # radial profile
+    t_vp = 0.0      # velocity profile
     n_halos = len(x)
     
     # Start with a reasonable initial estimate but allow growth
@@ -348,7 +441,13 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, rand
     galaxies = np.zeros((max_galaxies, 16))
     galaxy_count = 0
 
+    rng_occ = np.random.default_rng(int(random_seeds[0]))
+    Ncen_arr, Nsat_arr, has_hal = pdf.compute_hod_arrays_binned(logM, M_max, Ncen_mean, Nsat_mean, beta, conformity, K1_global, K2_global, rng_occ)
+
     for i in range(n_halos):
+        if has_hal[i] == 0:
+            continue
+        t0 = time.perf_counter()
         # Extract halo properties
         halo_x, halo_y, halo_z = x[i], y[i], z[i]
         halo_vx, halo_vy, halo_vz = vx[i], vy[i], vz[i]
@@ -358,19 +457,30 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, rand
         halo_id = halo_ids[i]
 
         # Set random seed for this halo
-        np.random.seed(int(random_seeds[i]))
+        rng_halo = np.random.default_rng(int(random_seeds[i]))
         
         # Convert to linear mass
         M = 10.0**halo_logM
+        Ncen = Ncen_arr[i]
+        Nsat = Nsat_arr[i]
 
-        idx = np.where((halo_logM >= M_min) & (halo_logM < M_max))[0]
-        if len(idx) == 0:
+        '''
+        k = np.searchsorted(M_max, halo_logM)
+        if k == len(M_max):
             Ncen = 0
             Nsat = 0
         else:
-            i = idx[0]
-            mean_Ncen = Ncen_mean[i]
-            mean_Nsat = Nsat_mean[i]
+            mean_Ncen = Ncen_mean[k]
+            mean_Nsat = Nsat_mean[k]
+
+        #idx = np.where((halo_logM >= M_min) & (halo_logM < M_max))[0]
+        #if len(idx) == 0:
+            #Ncen = 0
+            #Nsat = 0
+        #else:
+            #i = idx[0]
+            #mean_Ncen = Ncen_mean[i]
+            #mean_Nsat = Nsat_mean[i]
 
             # Bernouilli trial for central galaxy
             r = np.random.rand()
@@ -398,7 +508,8 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, rand
                 Nsat = pdf.neg_binomial_sample(mean_Nsat_adj, beta)
             else:
                 Nsat = pdf.poisson_sample(mean_Nsat_adj)
-
+        '''
+        t_occ += time.perf_counter() - t0
         # Check if we need to grow the array before processing this halo
         galaxies_needed = Ncen + Nsat
         if galaxy_count + galaxies_needed >= max_galaxies:
@@ -450,32 +561,43 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, rand
             # Generate position and velocity offsets
             if analytical_rp == True:
                 if extended_NFW == True:
-                    Dx, Dy, Dz = rp.generate_extended_position(M, zsnap, omega_M, c.rho_crit, cosm.Delta_vir, K, r0, alpha_r, beta_r, kappa_r, N0)
+                    t0 = time.perf_counter()
+                    Dx, Dy, Dz = rp.generate_extended_position(M, zsnap, omega_M, c.rho_crit, cosm.Delta_vir, halo_Rvir, Rmax, r0, alpha_r, beta_r, kappa_r, N0, rng=rng_halo)
+                    t_rp += time.perf_counter() - t0
                 else:
-                    if read_concentrations:
-                        Dx, Dy, Dz = rp.generate_nfw_position_from_c(Rvir=halo_Rvir, Rs=halo_Rs)
-                    else:
-                        Dx, Dy, Dz = rp.generate_nfw_position(M=M, zsnap=zsnap, omega_M=omega_M, K=K)
+                    t0 = time.perf_counter()
+                    Rvir_use = rp.get_effective_Rvir(M, zsnap, omega_M, halo_Rvir)
+                    c_eff = rp.get_effective_concentration(M=M,zsnap=zsnap,Rvir=Rvir_use,Rs=halo_Rs,K=K,read_concentrations=read_concentrations)
+                    Dx, Dy, Dz = rp.generate_nfw_position_from_concentration(Rvir=Rvir_use,c_eff=c_eff,rng=rng_halo)
+                    t_rp += time.perf_counter() - t0
             else:
-                Dx, Dy, Dz = rp.sample_empirical_position(r_bin_edges, probs_r)
+                t0 = time.perf_counter()
+                Dx, Dy, Dz = rp.sample_empirical_position(r_bin_edges, probs_r, rng=rng_halo)
+                t_rp += time.perf_counter() - t0
 
             if analytical_vp == True:
                 if extended_vp == True:
                     r_hat = np.array([Dx, Dy, Dz])
                     r_hat /= np.linalg.norm(r_hat)
 
-                    Dvx, Dvy, Dvz = vp.sample_velocity_analytic(r_hat, vr1, vr2, vr3, mu1, mu2, mu3, sigma1, sigma2, sigma3, v0_tan, epsilon_tan, omega_tan, delta_tan, vtan_min=0.0, vtan_max=2000.0)
+                    t0 = time.perf_counter()
+                    Dvx, Dvy, Dvz = vp.sample_velocity_analytic(r_hat, vr1, vr2, vr3, mu1, mu2, mu3, sigma1, sigma2, sigma3, v0_tan, epsilon_tan, omega_tan, delta_tan, vtan_min=0.0, vtan_max=2000.0, rng=rng_halo)
+                    t_vp += time.perf_counter() - t0
                 else:
-                    Dvx, Dvy, Dvz = vp.generate_virial_velocity(M, zsnap, omega_M)
+                    t0 = time.perf_counter()
+                    Dvx, Dvy, Dvz = vp.generate_virial_velocity(M, zsnap, omega_M, rng=rng_halo)
+                    t_vp += time.perf_counter() - t0
             else:
                 r_hat = np.array([Dx, Dy, Dz])
                 r_hat /= np.linalg.norm(r_hat)
-            
+
+                t0 = time.perf_counter()
                 Dvx, Dvy, Dvz = vp.sample_empirical_velocity(
                     r_hat,
                     vr_bin_edges, vr_probs,
-                    vtan_bin_edges, vtan_probs
+                    vtan_bin_edges, vtan_probs, rng=rng_halo
                     )
+                t_vp += time.perf_counter() - t0
 
             # Apply periodic boundary conditions
             xgal = (halo_x + Dx) % Lbox
@@ -500,9 +622,16 @@ def process_halos_chunk_bins(x, y, z, vx, vy, vz, logM, Rvir, Rs, halo_ids, rand
             galaxies[galaxy_count, 14] = halo_id
             galaxies[galaxy_count, 15] = 0.0       # is_central == 0
             galaxy_count += 1
-            
-    
+
     # Return only the filled portion of the array
+    total = t_occ + t_rp + t_vp
+    print(
+        f"[bins internal] "
+        f"occ={t_occ:.3f}s | "
+        f"rp={t_rp:.3f}s | "
+        f"vp={t_vp:.3f}s | "
+        f"sum={total:.3f}s"
+    )
     return galaxies[:galaxy_count, :]
 
 
@@ -593,11 +722,14 @@ def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_
     start_time = time.time()
     line_count = 0
     galaxy_count = 0
+    
 
     try:
         with open(params.outfile, 'w') as f_out:
             # Process file in chunks
+            timer = Timer()
             for chunk_data in io.read_halo_data_chunked(params.infile, params.ftype, chunk_size):
+                t_read = timer.lap()
                 if len(chunk_data) == 0:
                     continue
                 
@@ -612,9 +744,14 @@ def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_
                 Rvir = chunk_data[:, 7]
                 Rs = chunk_data[:, 8]
                 halo_ids = chunk_data[:, 9].astype(np.int64)
+                t_extract = timer.lap()
+
+                Rvir = Rvir/1000.0 # Convert from kpc/h to Mpc/h
+                Rs = Rs/1000.0       # Convert from kpc/h to Mpc/h
 
                 # Generate random seeds for each halo
                 random_seeds = np.random.randint(0, 2**31, size=len(x))
+                t_seed = timer.lap()
                 
                 
                 # Process chunk with Numba
@@ -624,17 +761,18 @@ def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_
                                 x=x, y=y, z=z, vx=vx, vy=vy, vz=vz, logM=logM, Rvir=Rvir, Rs=Rs, halo_ids=halo_ids, random_seeds=random_seeds,
                                 hodshape=params.hodshape, mu=params.mu, Ac=params.Ac, As=params.As,
                                 alpha=params.alpha, sig=params.sig, gamma=params.gamma,
-                                vfact=params.vfact, beta=params.beta, analytical_pdf=params.analytical_pdf,
+                                vfact=params.vfact, beta=params.beta,
                                 K=params.K, vt=params.vt, 
                                 vtdisp=params.vtdisp, M0=params.M0, M1=params.M1,
                                 omega_M=params.omega_M, Lbox=params.Lbox, zsnap=params.zsnap,
-                                alpha_r=params.alpha_r, beta_r=params.beta_r, N0=params.N0, r0=params.r0,
+                                alpha_r=params.alpha_r, beta_r=params.beta_r, N0=params.N0, r0=params.r0, Rmax=params.Rmax,
                                 kappa_r=params.kappa_r, extended_NFW=params.extended_NFW,
                                 vr1= params.vr1, vr2=params.vr2, vr3=params.vr3,
                                 mu1=params.mu1, mu2=params.mu2, mu3=params.mu3,
                                 sigma1=params.sigma1, sigma2=params.sigma2, sigma3=params.sigma3,
                                 extended_vp=params.extended_vp, v0_tan=params.v0_tan, epsilon_tan=params.epsilon_tan,
-                                omega_tan=params.omega_tan, delta_tan=params.delta_tan, 
+                                omega_tan=params.omega_tan, delta_tan=params.delta_tan,
+                                conformity=params.conformity, K1_global=K1_global, K2_global=K2_global,
                                 read_concentrations=params.read_concentrations
                                 )
                 else:
@@ -643,8 +781,8 @@ def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_
                                 vfact=params.vfact, beta=params.beta, K=params.K, vt=params.vt, vtdisp=params.vtdisp,
                                 omega_M=params.omega_M, Lbox=params.Lbox, zsnap=params.zsnap,
                                 alpha_r=params.alpha_r, beta_r=params.beta_r,
-                                analytical_pdf=params.analytical_pdf, N0=params.N0,
-                                r0=params.r0, kappa_r=params.kappa_r, extended_NFW=params.extended_NFW,
+                                N0=params.N0,
+                                r0=params.r0, Rmax=params.Rmax, kappa_r=params.kappa_r, extended_NFW=params.extended_NFW,
                                 analytical_vp=params.analytical_vp, analytical_rp=params.analytical_rp,
                                 vr1=params.vr1, vr2=params.vr2, vr3=params.vr3,
                                 mu1=params.mu1, mu2=params.mu2, mu3=params.mu3,
@@ -658,9 +796,21 @@ def process_halo_file_chunked(params, chunk_size=c.chunk_size, verbose=False, M_
                                 K1_global=K1_global, K2_global=K2_global,
                                 read_concentrations=params.read_concentrations
                                 )
-
+                t_process = timer.lap()
                 # Write results to file
                 io.write_galaxies_to_file(galaxies, f_out, True)
+                t_write = timer.lap()  
+
+                if verbose:
+                    print(
+                        f"[Chunk {line_count}] "
+                        f"read={t_read:.3f}s | "
+                        f"extract={t_extract:.3f}s | "
+                        f"seed={t_seed:.3f}s | "
+                        f"process={t_process:.3f}s | "
+                        f"write={t_write:.3f}s | "
+                        f"ngal={len(galaxies)}"
+                        )
 
                 line_count += len(chunk_data)
                 galaxy_count += len(galaxies)
@@ -752,7 +902,14 @@ def run_hod_model(params,verbose=False):
     process_halos_chunk_analytical : Per-halo galaxy generation for analytical HOD shapes.
     process_halos_chunk_bins : Per-halo galaxy generation for empirical HOD shapes.
     """
-
+    if params.conformity == True:
+        if params.HODfit2sim:
+            K1_global, K2_global = io.read_global_conformity_factors(params.hod_shape_file)
+        else:
+            K1_global, K2_global = np.loadtxt(params.conformity_file, unpack=True)
+    else:
+        K1_global, K2_global = 1.0, 1.0
+    
     sep = io.line_separator()
     print(sep+"\nHOD Galaxy Mock Generation\n"+sep)
 
@@ -761,15 +918,153 @@ def run_hod_model(params,verbose=False):
         print("Parameter validation failed. Please check your parameters.")
         io.print_parameter_info()
         return -1
+    
+    if params.derive_mu:
+        logM_halos = amp.load_logM_from_halo_catalog(
+            infile=params.infile,
+            ftype=params.ftype,
+            chunk_size=c.chunk_size,
+        )
 
+        bias_coeffs, bias_logM, bias_vals = amp.fit_bias_polynomial_from_file(
+            bias_file=params.bias_file,
+            degree=params.bias_poly_degree,
+        )
+
+        print("Fitted halo-bias polynomial for derive_mu:")
+        print(f"  bias_file        = {params.bias_file}")
+        print(f"  polynomial degree= {params.bias_poly_degree}")
+        print(f"  coefficients     = {bias_coeffs}")
+        print(io.line_separator())
+        
+        solved = amp.solve_mu_Ac_As_from_targets(
+            logM_halos=logM_halos,
+            Lbox=params.Lbox,
+            hodshape=params.hodshape,
+            ngal_target=params.ngal_target,
+            fsat_target=params.fsat_target,
+            bgal_target=params.bgal_target,
+            bias_coeffs=bias_coeffs,
+            mu_min=params.mu_min,
+            mu_max=params.mu_max,
+            mu_tol=params.mu_tol,
+            mu_max_iter=params.mu_max_iter,
+            conformity=params.conformity,
+            K1_global=K1_global, 
+            K2_global=K2_global,
+        )
+
+        params = params._replace(
+            mu=solved["mu"],
+            Ac=solved["Ac"],
+            As=solved["As"],
+            M0=solved["M0"],
+            M1=solved["M1"],
+            alpha=solved["alpha"],
+            sig=solved["sig"],
+            gamma=solved["gamma"],
+        )
+
+        
+
+        print("Derived HOD parameters from ngal, fsat and bgal:")
+        print(f"  mu = {params.mu:.6f}")
+        print(f"  Ac = {params.Ac:.6e}")
+        print(f"  As = {params.As:.6e}")
+        print(f"  bgal(pred) = {solved['bgal']:.6f}")
+        print(f"  bracket = {solved['mu_bracket']}")
+        print(io.line_separator())
+
+        ncen_pred, nsat_pred, ngal_pred, fsat_pred = amp.predict_number_densities_from_halo_masses(
+            logM_halos=logM_halos,
+            Lbox=params.Lbox,
+            mu=params.mu,
+            sig=params.sig,
+            gamma=params.gamma,
+            hodshape=params.hodshape,
+            M0=params.M0,
+            M1=params.M1,
+            alpha=params.alpha,
+            Ac=params.Ac,
+            As=params.As,
+            conformity=params.conformity,
+            K1_global=K1_global,
+            K2_global=K2_global,
+        )
+
+        print("Check of derived Ac and As:")
+        print(f"  ngal_target = {params.ngal_target:.6e}")
+        print(f"  ngal_pred   = {ngal_pred:.6e}")
+        print(f"  fsat_target = {params.fsat_target:.6f}")
+        print(f"  fsat_pred   = {fsat_pred:.6f}")
+        print(f"  ncen_pred   = {ncen_pred:.6e}")
+        print(f"  nsat_pred   = {nsat_pred:.6e}")
+        print(io.line_separator())
+
+    if params.derive_amplitudes and not params.derive_mu:
+        logM_halos = amp.load_logM_from_halo_catalog(
+            infile=params.infile,
+            ftype=params.ftype,
+            chunk_size=c.chunk_size,
+        )
+
+        Ac_new, As_new, Ic, Is = amp.compute_Ac_As_from_halo_masses(
+            logM_halos=logM_halos,
+            Lbox=params.Lbox,
+            mu=params.mu,
+            sig=params.sig,
+            gamma=params.gamma,
+            hodshape=params.hodshape,
+            M0=params.M0,
+            M1=params.M1,
+            alpha=params.alpha,
+            ngal_target=params.ngal_target,
+            fsat_target=params.fsat_target,
+            conformity=params.conformity,
+            K1_global=K1_global,
+            K2_global=K2_global,
+
+        )
+
+        params = params._replace(Ac=Ac_new, As=As_new)
+
+        ncen_pred, nsat_pred, ngal_pred, fsat_pred = amp.predict_number_densities_from_halo_masses(
+            logM_halos=logM_halos,
+            Lbox=params.Lbox,
+            mu=params.mu,
+            sig=params.sig,
+            gamma=params.gamma,
+            hodshape=params.hodshape,
+            M0=params.M0,
+            M1=params.M1,
+            alpha=params.alpha,
+            Ac=params.Ac,
+            As=params.As,
+            conformity=params.conformity,
+            K1_global=K1_global,
+            K2_global=K2_global,
+
+        )
+
+        print("Derived analytical amplitudes from halo masses:")
+        print(f"  ngal_target = {params.ngal_target:.6e}")
+        print(f"  fsat_target = {params.fsat_target:.6f}")
+        print(f"  Ic = {Ic:.6e}")
+        print(f"  Is = {Is:.6e}")
+        print(f"  Ac = {params.Ac:.6e}")
+        print(f"  As = {params.As:.6e}")
+        print("Predicted densities with derived amplitudes:")
+        print(f"  ncen = {ncen_pred:.6e}")
+        print(f"  nsat = {nsat_pred:.6e}")
+        print(f"  ngal = {ngal_pred:.6e}")
+        print(f"  fsat = {fsat_pred:.6f}")
+        print(io.line_separator())
+    
     if params.analytical_shape == False:
         if params.HODfit2sim == True:
             M_min, M_max, Ncen_mean, Nsat_mean = io.read_occupation_from_h5(params.hod_shape_file)
-            K1_global, K2_global = io.read_global_conformity_factors(params.hod_shape_file)
         else:
             M_min, M_max, Ncen_mean, Nsat_mean = np.loadtxt(params.hod_shape_file, unpack=True)
-            if params.conformity == True:
-                K1_global, K2_global = np.loadtxt(params.conformity_file, unpack=True)
 
     if params.analytical_rp == False:
         if params.HODfit2sim == True:
@@ -788,7 +1083,6 @@ def run_hod_model(params,verbose=False):
 
     if params.analytical_shape == True:
         M_min = M_max = Ncen_mean = Nsat_mean = None
-        K1_global = K2_global = None
 
     if params.analytical_rp == True:
         r_bin_edges = probs_r = None
@@ -819,5 +1113,21 @@ def run_hod_model(params,verbose=False):
         print(f"Total processing time: {total_time:.2f} seconds")
         print(f"Processing rate: {nhalos/total_time:.1f} halos/second")
     print(f"SUCCESS: Completed processing {nhalos} halos")
+
+    mock = np.loadtxt(params.outfile)
+    if mock.ndim == 1:
+        mock = mock[None, :]
+
+    Ngal = len(mock)
+    Nsat_gal = np.sum(mock[:, 15] == 0)
+    ngal_mock = Ngal / (params.Lbox ** 3)
+    fsat_mock = Nsat_gal / Ngal if Ngal > 0 else 0.0
+
+    print("DEBUG realized mock densities:")
+    print(f"  Ngal      = {Ngal}")
+    print(f"  Nsat_gal  = {Nsat_gal}")
+    print(f"  ngal_mock = {ngal_mock:.6e}")
+    print(f"  fsat_mock = {fsat_mock:.6f}")
+    print(io.line_separator())
     
     return 0
