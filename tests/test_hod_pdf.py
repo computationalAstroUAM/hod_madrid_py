@@ -4,7 +4,7 @@ import numpy as np
 import math
 from numba import jit
 
-import src.hod_pdf as pdf
+import hod_madrid_py.src.hod_madrid_py.hod_pdf as pdf
 
 class TestPoissonSample(unittest.TestCase):
     def setUp(self):

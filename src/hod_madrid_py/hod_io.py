@@ -1,31 +1,55 @@
 # hod_io.py
 
 """
-I/O helpers and typed configuration structures for HOD simulations.
+Input/output helpers and configuration structures for the HOD mock pipeline.
 
 Overview
 --------
-This module defines:
-  • A strongly-typed parameter container (`HODParams`) holding everything needed
-    to run a Halo Occupation Distribution (HOD) realization and produce a mock
-    galaxy catalogue.
-  • Name-resolution maps (imported from `hod_config`) that help read halo
-    catalogues in HDF5/TXT formats with heterogeneous column names.
+This module provides the infrastructure needed to:
 
-Assumptions & Units
--------------------
-- Cosmology: flat ΛCDM (Ω_M + Ω_Λ = 1) unless otherwise stated by the caller.
-- Distances: comoving, in Mpc/h.
-- Masses: in Msun/h.
-- Velocities: km/s.
-- Randomness: callers should pass a reproducible `seed` if determinism is required.
+1. Collect and validate the full configuration of an HOD run.
+2. Read halo catalogues in a normalized internal format.
+3. Write mock galaxy catalogues to disk.
+4. Load auxiliary tabulated inputs such as HODfit2sim occupation data and
+   conformity factors.
 
-Typical usage
--------------
-1) Gather file paths and physical/HOD parameters (from config or CLI).
-2) Build a `HODParams` instance (directly or via a helper like `create_hod_params`).
-3) Pass it to the HOD driver (e.g., `run_hod_model(params, ...)`).
+The guiding design principle is to separate:
 
+- physical modelling, handled in other modules,
+- file-format normalization and runtime configuration, handled here.
+
+Canonical halo representation
+-----------------------------
+Once an input halo catalogue has been parsed, it is converted to the canonical
+column order
+
+    [x, y, z, vx, vy, vz, logM, Rvir, Rs, id]
+
+which is the format consumed by the rest of the pipeline.
+
+Units
+-----
+The pipeline assumes:
+- positions in comoving Mpc/h,
+- velocities in km/s,
+- masses in Msun/h,
+- radii in kpc/h in raw external catalogues, later converted to Mpc/h by the
+  reader when needed.
+
+Supported input formats
+-----------------------
+- TXT
+- HDF5
+- NPY
+
+TXT and HDF5 catalogues may contain either:
+- full structural information including 'Rvir' and 'Rs', or
+- only positions, velocities, mass, and halo identifier.
+
+Dependencies
+------------
+This module relies on the naming conventions defined in
+'src.hod_madrid_py.hod_config'.
 """
 
 import math
@@ -34,8 +58,8 @@ import os
 from pathlib import Path
 from typing import NamedTuple, Optional, Union, Literal, Dict, Sequence, Mapping, Generator, Tuple, TextIO
 import numpy as np
-import src.hod_const as c
-from src.hod_config import (
+import src.hod_madrid_py.hod_const as c
+from src.hod_madrid_py.hod_config import (
     H5_NAME_MAP_WITH_R, H5_NAME_MAP_NO_R,
     TXT_NAME_MAP_WITH_R, TXT_NAME_MAP_NO_R,
     TXT_POS_WITH_R, TXT_POS_NO_R
@@ -95,14 +119,66 @@ class HODParams(NamedTuple):
     gamma : float
         High-mass slope modifier for centrals (dimensionless).
 
+    AMPLITUDE / MU DERIVATION (OPTIONAL)
+    -----------------------------------
+    derive_amplitudes : bool
+        If True, derive the analytical amplitudes Ac and As from target
+        number density and satellite fraction.
+
+    derive_mu : bool
+        If True, solve for the characteristic mass parameter mu so that the
+        model matches a target galaxy bias bgal, in addition to ngal and fsat.
+
+    ngal_target : float
+        Target galaxy number density [h^3 / Mpc^3].
+
+    fsat_target : float
+        Target satellite fraction.
+
+    bgal_target : float
+        Target large-scale galaxy bias used when derive_mu=True.
+
+    bias_file : str
+        Path to a text file containing the halo bias relation, with two columns:
+            log10(M)   bias
+        This file is read and fitted internally with a polynomial before
+        solving for mu.
+
+    bias_poly_degree : int
+        Degree of the polynomial used to approximate the halo bias relation
+        b(log10 M) from `bias_file`.    AMPLITUDE / MU DERIVATION (OPTIONAL)
+    -----------------------------------
+    derive_amplitudes : bool
+        If True, derive the analytical amplitudes Ac and As from target
+        number density and satellite fraction.
+
+    derive_mu : bool
+        If True, solve for the characteristic mass parameter mu so that the
+        model matches a target galaxy bias bgal, in addition to ngal and fsat.
+
+    ngal_target : float
+        Target galaxy number density [h^3 / Mpc^3].
+
+    fsat_target : float
+        Target satellite fraction.
+
+    bgal_target : float
+        Target large-scale galaxy bias used when derive_mu=True.
+
+    bias_file : str
+        Path to a text file containing the halo bias relation, with two columns:
+            log10(M)   bias
+        This file is read and fitted internally with a polynomial before
+        solving for mu.
+
+    bias_poly_degree : int
+        Degree of the polynomial used to approximate the halo bias relation
+        b(log10 M) from `bias_file`.
+
     CENTRAL/SATELLITE PDF
     ---------------------
-    analytical_pdf : bool
-        Use an analytical PDF for satellite number if True; else read from file.
     beta : float
         PDF shape/dispersion control (e.g., 0 = Poisson, -2 = nearest-integer).
-    hod_pdf_file : str
-        Empirical PDF file (if 'analytical_pdf=False').
 
     CONFORMITY (OPTIONAL)
     ---------------------
@@ -127,6 +203,10 @@ class HODParams(NamedTuple):
         Radial normalization (dimensionless).
     r0 : float
         Characteristic radius (Mpc/h).
+    Rmax : float
+        Maximum radius [Mpc/h] used for the extended radial profile.
+        This is the outer limit up to which the fitted analytical profile is
+        defined and from which satellite positions are sampled.
     alpha_r : float
         Inner slope parameter (dimensionless).
     beta_r : float
@@ -187,9 +267,19 @@ class HODParams(NamedTuple):
     sig: float 
     gamma: float
     #------------
-    analytical_pdf: bool
+    derive_amplitudes: bool
+    derive_mu: bool
+    ngal_target: float
+    fsat_target: float
+    bgal_target: float
+    bias_file: str
+    bias_poly_degree: int
+    mu_min: float
+    mu_max: float
+    mu_tol: float
+    mu_max_iter: int
+    #------------
     beta: float
-    hod_pdf_file: str
     #------------
     conformity: bool
     conformity_file: str
@@ -201,6 +291,7 @@ class HODParams(NamedTuple):
     hod_rp_file: str
     N0: float
     r0: float
+    Rmax: float
     alpha_r: float
     beta_r: float
     kappa_r: float
@@ -229,7 +320,7 @@ def create_hod_params(
     # ---------------- FILE PATHS & FORMATS ----------------
     infile: Union[str, Path],
     outdir: Union[str, Path],
-    ftype: Literal["txt", "h5"] = "txt",
+    ftype: Literal["txt", "hdf5", "h5", "npy"] = "txt",
 
     # ---------------- REPRODUCIBILITY & BOX ----------------
     seed: int = 50,
@@ -251,10 +342,21 @@ def create_hod_params(
     sig: float = 0.08,
     gamma: Optional[float] = -1.4,
 
+    # --------------- AMPLITUDE DERIVATION (OPTIONAL) ---------------
+    derive_amplitudes: bool = False,
+    derive_mu: bool = False,
+    ngal_target: float = 0.0,
+    fsat_target: float = 0.0,
+    bgal_target: float = 0.0,
+    bias_file: Optional[Union[str, Path]] = None,
+    bias_poly_degree: int = 4,
+    mu_min: float = 10.0,
+    mu_max: float = 13.5,
+    mu_tol: float = 1.0e-4,
+    mu_max_iter: int = 100,
+
     # ---------------- CENTRAL/SATELLITE PDF ----------------
-    analytical_pdf: bool = True,
     beta: float = 0.0,
-    hod_pdf_file: Optional[Union[str, Path]] = None,
 
     # ---------------- CONFORMITY (OPTIONAL) ----------------
     conformity: bool = False,
@@ -268,6 +370,7 @@ def create_hod_params(
     hod_rp_file: Optional[Union[str, Path]] = None,
     N0: Optional[float] = None,
     r0: Optional[float] = None,              # Mpc/h
+    Rmax: float = None,
     alpha_r: Optional[float] = None,
     beta_r: Optional[float] = None,
     kappa_r: Optional[float] = None,
@@ -295,40 +398,34 @@ def create_hod_params(
 ) -> Optional[HODParams]:
     
     """
-    Build and validate a complete `HODParams` configuration object.
+    Build and validate a complete 'HODParams' object.
 
-    This helper:
-      1) Validates essential inputs (`infile`, `outdir`, `ftype`, `zsnap`, `Lbox`, `omega_M`).
-      2) Ensures required auxiliary files are present when *analytical* flags are False.
-      3) Creates a standardized output filename inside `outdir`.
-      4) Returns a fully populated `HODParams` (or None on failure).
+    This helper performs three tasks:
+    1. Normalize and validate input paths and basic run settings.
+    2. Check that the required auxiliary files are present for the selected
+       modelling mode.
+    3. Construct a fully populated immutable configuration record.
 
     Parameters
     ----------
-    (Grouped and ordered exactly as in 'HODParams'; see function signature.)
+    The parameters are grouped by function and mirror the structure of
+    'HODParams'. They describe:
+    - input/output paths,
+    - cosmological setup,
+    - analytical or empirical HOD settings,
+    - optional derivation of amplitudes or 'mu',
+    - radial and velocity profile choices.
 
     Returns
     -------
     HODParams or None
-        A ready-to-use configuration container, or None if a blocking validation
-        failed (a message is printed explaining the issue).
+        A fully initialized configuration object if validation succeeds, or
+        'None' if a blocking inconsistency is found.
 
     Notes
     -----
-    - Units: distances in Mpc/h, masses in Msun/h, velocities in km/s.
-    - 'gamma': if None, falls back to 'src.hod_const.default_gamma'.
-    - Output filename pattern (inside 'outdir'):
-        galaxies_{Lbox}Mpc_NFW_mu{mu}_Ac{Ac}_As{As}_vfact{vfact}_beta{beta}_K{K}_vt{vt}pm{vtdisp}.dat
-      Values are formatted for compact reproducibility tags.
-
-    Examples
-    --------
-    >>> params = create_hod_params(
-    ...     infile="data/halos.txt", outdir="output", ftype="txt",
-    ...     seed=42, zsnap=1.0, Lbox=1000.0, omega_M=0.3089
-    ... )
-    >>> params.outfile
-    'output/galaxies_1000Mpc_NFW_mu12.000_Ac1.0000_As0.50000_vfact1.00_beta0.000_K1.00_vt0pm0.dat'
+    The output filename is generated automatically from the main physical
+    parameters in order to preserve a reproducible naming scheme across runs.
     """
     # ---- defaults/normalization of simple inputs ----
     if gamma is None:
@@ -350,8 +447,22 @@ def create_hod_params(
     # Ensure the output directory exists
     outdir_path.mkdir(parents=True, exist_ok=True)
 
-    if ftype not in ("txt", "h5"):
-        print("STOP (hod_io): ftype must be 'txt' or 'h5'.")
+    if derive_mu:
+        if bias_file is None:
+            print("STOP (hod_io): derive_mu=True requires 'bias_file'.")
+            return None
+
+        if bias_poly_degree < 0:
+            print("STOP (hod_io): bias_poly_degree must be >= 0.")
+            return None
+
+        bias_file_path = Path(bias_file)
+        if not check_input_file(bias_file_path):
+            print("STOP (hod_io): Please check your bias_file.")
+            return None
+
+    if ftype not in ("txt", "h5", "npy"):
+        print("STOP (hod_io): ftype must be 'txt', 'h5', or 'npy'.")
         return None
 
     # Required cosmology/box metadata
@@ -362,6 +473,10 @@ def create_hod_params(
     # ---- auxiliary file checks when not using analytical options ----
     if not analytical_shape and (hod_shape_file is None):
         print("STOP (hod_io): For a non-analytical HOD shape, provide 'hod_shape_file'.")
+        return None
+
+    if conformity and (not HODfit2sim) and (conformity_file is None):
+        print("STOP (hod_io): For conformity without HODfit2sim, provide 'conformity_file'.")
         return None
 
     if not analytical_rp and (hod_rp_file is None):
@@ -407,10 +522,21 @@ def create_hod_params(
         mu=mu, Ac=Ac, As=As,
         M0=M0, M1=M1, alpha=alpha, sig=sig, gamma=gamma,
 
+        # AMLPITUDE DERIVATION (OPTIONAL)
+        derive_amplitudes=derive_amplitudes,
+        ngal_target=ngal_target,
+        fsat_target=fsat_target,
+        bgal_target=bgal_target,
+        bias_file=str(bias_file) if bias_file is not None else "",
+        bias_poly_degree=bias_poly_degree,
+        derive_mu=derive_mu,
+        mu_min=mu_min,
+        mu_max=mu_max,
+        mu_tol=mu_tol,
+        mu_max_iter=mu_max_iter,
+
         # CENTRAL/SATELLITE PDF
-        analytical_pdf=analytical_pdf,
         beta=beta,
-        hod_pdf_file=str(hod_pdf_file) if hod_pdf_file is not None else "",
 
         # CONFORMITY (OPTIONAL)
         conformity=conformity,          
@@ -424,6 +550,7 @@ def create_hod_params(
         hod_rp_file=str(hod_rp_file) if hod_rp_file is not None else "",
         N0=N0 if N0 is not None else 0.0,
         r0=r0 if r0 is not None else 0.0,
+        Rmax=Rmax,
         alpha_r=alpha_r if alpha_r is not None else 0.0,
         beta_r=beta_r if beta_r is not None else 0.0,
         kappa_r=kappa_r if kappa_r is not None else 0.0,
@@ -452,17 +579,18 @@ def create_hod_params(
 
 def create_output_directory(output_file: Union[str, Path]) -> bool:
     """
-    Ensure the parent directory of `output_file` exists.
+    Ensure that the parent directory of an output file exists.
 
     Parameters
     ----------
-    output_file : str | Path
-        Target file path whose parent directory should exist.
+    output_file : str or Path
+        Target output path.
 
     Returns
     -------
     bool
-        True if the directory exists or was created successfully; False otherwise.
+        True if the parent directory exists or was created successfully, and
+        False otherwise.
     """
     output_dir = Path(output_file).parent
     try:
@@ -600,6 +728,53 @@ def validate_parameters(params) -> bool:
     if params.sig < 0:
         errors.append(f"sig = {params.sig:.6g} must be ≥ 0")
     # gamma can be negative; no bound enforced
+    if params.conformity:
+        if not isinstance(params.conformity, bool):
+            errors.append("conformity must be a boolean")
+
+        if (not params.HODfit2sim) and (params.conformity_file == ""):
+            errors.append("conformity=True without HODfit2sim requires conformity_file")
+
+    if params.derive_amplitudes:
+        if not params.analytical_shape:
+            errors.append("derive_amplitudes=True currently requires analytical_shape=True")
+
+        if params.ngal_target <= 0:
+            errors.append(f"ngal_target = {params.ngal_target:.6g} must be > 0")
+
+        if not (0.0 < params.fsat_target < 1.0):
+            errors.append(f"fsat_target = {params.fsat_target:.6g} must be in (0,1)")
+
+    if params.derive_mu:
+        if not params.analytical_shape:
+            errors.append("derive_mu=True currently requires analytical_shape=True")
+
+        if not params.derive_amplitudes:
+            errors.append("derive_mu=True currently requires derive_amplitudes=True")
+
+        if params.ngal_target <= 0:
+            errors.append(f"ngal_target = {params.ngal_target:.6g} must be > 0")
+
+        if not (0.0 < params.fsat_target < 1.0):
+            errors.append(f"fsat_target = {params.fsat_target:.6g} must be in (0,1)")
+
+        if params.bgal_target <= 0:
+            errors.append(f"bgal_target = {params.bgal_target:.6g} must be > 0")
+
+        if params.mu_max <= params.mu_min:
+            errors.append("mu_max must be > mu_min")
+
+        if params.mu_tol <= 0:
+            errors.append("mu_tol must be > 0")
+
+        if params.mu_max_iter < 5:
+            errors.append("mu_max_iter must be >= 5")
+        
+        if params.bias_file == "":
+            errors.append("derive_mu=True requires bias_file")
+
+        if params.bias_poly_degree < 0:
+            errors.append("bias_poly_degree must be >= 0")
 
     # Cosmology
     if not (0.0 < params.omega_M < 1.0):
@@ -610,6 +785,9 @@ def validate_parameters(params) -> bool:
         errors.append(f"K = {params.K:.6g} must be > 0 (radial scaling/truncation)")
     if params.read_concentrations not in (True, False):
         errors.append("read_concentrations must be a boolean")
+
+    if params.extended_NFW and params.Rmax <= 0:
+        errors.append(f"Rmax = {params.Rmax:.6g} must be > 0 for the extended radial profile")
 
     # Velocity profile
     if params.vfact <= 0:
@@ -659,36 +837,28 @@ def resolve_names_from_header(
     raise_on_missing: bool = True,
 ) -> Dict[str, int]:
     """
-    Resolve standard column keys to indices in a text header.
+    Resolve canonical field names against a TXT header.
 
     Parameters
     ----------
     header_names : sequence of str
-        Header tokens as read from the file (e.g., first line split on whitespace).
-    name_map : dict[str, list[str]]
-        Mapping from standard keys (e.g., "x","y","z") to a list of accepted
-        synonyms in the header.
+        Header tokens extracted from a TXT file.
+    name_map : mapping
+        Dictionary mapping canonical keys to accepted external aliases.
     case_sensitive : bool, optional
-        If False (default), matching is case-insensitive.
+        If True, preserve case when matching header entries.
     raise_on_missing : bool, optional
-        If True (default), raise KeyError when any standard key is not found.
-        If False, missing keys are omitted from the returned dict.
+        If True, raise an error if a required key cannot be resolved.
 
     Returns
     -------
-    dict[str, int]
-        Mapping standard key -> column index in `header_names`.
+    dict
+        Mapping from canonical field name to column index in the header.
 
     Raises
     ------
     KeyError
-        If a required key is missing and `raise_on_missing=True`.
-
-    Notes
-    -----
-    - If multiple aliases for the same key appear in the header, the first match
-      in `name_map[std]` order is used.
-    - Matching is O(n) to build the index + O(1) per alias lookup.
+        If one or more required keys are not found and 'raise_on_missing=True'.
     """
     # Normalize header (and build index for O(1) lookups)
     if case_sensitive:
@@ -727,35 +897,28 @@ def try_mapping_hdf5(
     raise_on_missing: bool = True,
 ) -> Dict[str, str]:
     """
-    Map standard keys to actual HDF5 dataset field names.
+    Resolve canonical field names against an HDF5 structured dtype.
 
     Parameters
     ----------
     dtype_names : sequence of str
-        Field names from the HDF5 dtype (e.g., dataset.dtype.names).
-    name_map : dict[str, list[str]]
-        Mapping from standard keys to accepted synonyms in the HDF5 dtype.
+        Field names present in the HDF5 dataset dtype.
+    name_map : mapping
+        Dictionary mapping canonical keys to accepted external aliases.
     case_sensitive : bool, optional
-        If False, match case-insensitively (default True for HDF5 as names
-        are often case-stable).
+        If True, match field names case-sensitively.
     raise_on_missing : bool, optional
-        If True (default), raise KeyError if any standard key cannot be resolved.
-        If False, missing keys are omitted.
+        If True, raise an error if one or more required keys are missing.
 
     Returns
     -------
-    dict[str, str]
-        Mapping standard key -> actual field name present in the HDF5 dataset.
+    dict
+        Mapping from canonical field name to actual HDF5 field name.
 
     Raises
     ------
     KeyError
-        If a required key is missing and `raise_on_missing=True`.
-
-    Notes
-    -----
-    - If multiple aliases exist for the same standard key, the first one found
-      in `name_map[std]` is chosen.
+        If required fields are not found and 'raise_on_missing=True'.
     """
     if case_sensitive:
         available = {n: n for n in dtype_names}
@@ -785,106 +948,83 @@ def try_mapping_hdf5(
     return out
 
 def read_halo_data_chunked(
-    filename: Union[str, Path],
-    ftype: Literal["txt", "hdf5"] = "txt",
-    chunk_size: int = c.chunk_size,
-) -> Generator[np.ndarray, None, None]:
+    filename,
+    ftype="txt",
+    chunk_size=c.chunk_size,
+):
     """
-    Stream halo data in fixed-size chunks to limit memory usage.
+    Dispatch chunked halo-catalogue reading according to file type.
 
     Parameters
     ----------
-    filename : str | Path
-        Input catalog path.
-    ftype : {'txt','hdf5'}, default 'txt'
-        Input format selector. Dispatches to the appropriate reader.
-    chunk_size : int, default c.chunk_size
-        Maximum number of halos per yielded chunk.
+    filename : str or Path
+        Input halo catalogue path.
+    ftype : str, optional
+        File type specifier.
+    chunk_size : int, optional
+        Number of rows per yielded chunk.
 
     Yields
     ------
-    np.ndarray, shape (n, 10)
-        A block of rows with the canonical column order:
-        [x, y, z, vx, vy, vz, logM, Rvir, Rs, id].
-        The last chunk may have n < chunk_size.
+    ndarray
+        Halo data in canonical column order.
 
-    Notes
-    -----
-    - Actual parsing/mapping from headers/fields is handled in the backend
-      readers: 'read_hdf5_chunked' and 'read_txt_chunked'.
-    - This function only dispatches and forwards the yielded blocks.
+    Raises
+    ------
+    ValueError
+        If 'ftype' is not supported.
     """
+    filename = Path(filename)
     ftype_norm = str(ftype).lower()
-    if ftype_norm == "hdf5":
-        yield from read_hdf5_chunked(str(filename), chunk_size)
-    elif ftype_norm == "txt":
-        yield from read_txt_chunked(str(filename), chunk_size)
-    else:
-        raise ValueError("ftype must be 'txt' or 'hdf5'")
 
+    if ftype_norm in ("hdf5", "h5"):
+        yield from read_hdf5_chunked(str(filename), chunk_size)
+
+    elif ftype_norm == "txt":
+        npy_file = Path("output") / f"{filename.stem}.npy"
+
+        if not npy_file.exists():
+            npy_file = convert_txt_to_npy(filename)
+
+        yield from read_npy_chunked(npy_file, chunk_size)
+
+    elif ftype_norm == "npy":
+        yield from read_npy_chunked(str(filename), chunk_size)
+
+    else:
+        raise ValueError("ftype must be one of {'txt', 'h5', 'hdf5', 'npy'}")
     
 def read_txt_chunked(
     filename: Union[str, Path],
     chunk_size: int = c.chunk_size,
 ) -> Generator[np.ndarray, None, None]:
     """
-    Stream a TXT halo catalog in fixed-size chunks with canonical columns.
+    Stream a TXT halo catalogue in fixed-size chunks.
 
-    The function reads a whitespace-delimited text file that may optionally
-    include a header line (stored in comment lines starting with '#').
-    It returns blocks (chunks) of rows as NumPy arrays with shape (n, 10)
-    and the **canonical column order**:
+    The yielded arrays always follow the canonical halo-column convention
 
-        [x, y, z, vx, vy, vz, logM, Rvir, Rs, id]
+        [x, y, z, vx, vy, vz, logM, Rvir, Rs, id].
 
-    If the catalog does not contain Rvir/Rs, those columns are filled with NaN.
-    Rvir and Rs are **converted from kpc/h to Mpc/h** (division by 1000).
+    If the input catalogue does not contain 'Rvir' and 'Rs', these columns are
+    filled with 'NaN'. If the radii are present, they are interpreted as kpc/h
+    and converted to Mpc/h.
 
     Parameters
     ----------
-    filename : str | pathlib.Path
-        Path to the input catalog (whitespace-delimited). Lines starting with
-        '#' are treated as comments; the last such commented line is considered
-        a header with column names (if present).
-    chunk_size : int, default c.chunk_size
-        Maximum number of rows per yielded chunk. The last chunk may have fewer.
+    filename : str or Path
+        Input TXT catalogue path.
+    chunk_size : int, optional
+        Maximum number of rows yielded per chunk.
 
     Yields
     ------
-    np.ndarray, shape (n, 10), dtype float
-        Chunk with canonical columns:
-        x, y, z, vx, vy, vz, logM, Rvir[Mpc/h], Rs[Mpc/h], id
+    ndarray
+        Halo chunk in canonical format.
 
-    Expected input schemas
-    ----------------------
-    - **With header** (in comment lines):
-        The last comment line is parsed as header tokens. We attempt to resolve
-        columns using:
-          1) TXT_NAME_MAP_WITH_R  (expects Rvir and Rs)
-          2) TXT_NAME_MAP_NO_R    (without radii)
-        If neither mapping succeeds, a KeyError is raised upstream.
-    - **Without header**:
-        We infer by number of tokens in the first data row:
-          - >= 10 → TXT_POS_WITH_R (fixed positions, includes radii)
-          - >=  8 → TXT_POS_NO_R   (fixed positions, no radii)
-          - <   8 → ValueError
-
-    Notes
-    -----
-    - Separator: any whitespace (str.split()).
-    - Comments: lines starting with '#'.
-    - Units: Rvir and Rs are assumed to be in kpc/h if present; they are converted
-      to Mpc/h. If your file already stores Mpc/h, remove the /1000 conversion.
-    - The function performs minimal validation per-line: it skips lines with too
-      few tokens (<8 or <10 depending on the schema).
-
-    Examples
-    --------
-    >>> for block in read_txt_chunked("halos.txt", chunk_size=20000):
-    ...     x, y, z = block[:,0], block[:,1], block[:,2]
-    ...     logM     = block[:,6]
-    ...     # process the chunk...
-
+    Raises
+    ------
+    ValueError
+        If a headerless TXT file contains fewer than 8 columns.
     """
     filename = str(filename)  # ensure str for open()
     try:
@@ -996,56 +1136,87 @@ def read_txt_chunked(
         print(f"ERROR: Error reading file {filename}: {e}")
         return
 
+def read_npy_chunked(
+    filename: Union[str, Path],
+    chunk_size: int = c.chunk_size,
+) -> Generator[np.ndarray, None, None]:
+    """
+    Stream a canonical halo catalogue stored in '.npy' format.
+
+    Parameters
+    ----------
+    filename : str or Path
+        Path to the '.npy' file.
+    chunk_size : int, optional
+        Maximum number of rows per yielded chunk.
+
+    Yields
+    ------
+    ndarray
+        Halo chunk in canonical format.
+
+    Raises
+    ------
+    ValueError
+        If the array stored in the file does not have shape '(N, 10)'.
+    """
+    filename = str(filename)
+
+    try:
+        # Memory-mapped load: does NOT read everything into RAM
+        data = np.load(filename, mmap_mode="r")
+
+        if data.ndim != 2 or data.shape[1] != 10:
+            raise ValueError(
+                f"NPY halo catalog must have shape (N, 10); got {data.shape}"
+            )
+
+        n = data.shape[0]
+
+        for start in range(0, n, chunk_size):
+            yield np.asarray(data[start:start + chunk_size], dtype=float)
+
+    except FileNotFoundError:
+        print(f"ERROR: Could not open input file {filename}")
+        return
+    except Exception as e:
+        print(f"ERROR: Error reading file {filename}: {e}")
+        return
+
 def read_hdf5_chunked(
     filename: Union[str, Path],
     chunk_size: int = 10000,
 ) -> Generator[np.ndarray, None, None]:
     """
-    Stream an HDF5 halo catalog in fixed-size chunks with canonical columns.
+    Stream a halo catalogue from an HDF5 file in canonical format.
 
-    This reader yields NumPy arrays with shape (n, 10) in the canonical order:
-        [x, y, z, vx, vy, vz, logM, Rvir, Rs, id]
+    The function supports both:
+    - structured datasets with named fields,
+    - dense 2D datasets with fixed column order.
 
-    It supports two HDF5 layouts:
-      1) **Structured dataset** (with named fields, i.e. `dtype.names` present).
-         - Resolves field names via your synonym maps:
-           `H5_NAME_MAP_WITH_R` (expects Rvir/Rs) or `H5_NAME_MAP_NO_R` (no radii).
-         - Converts `Rvir`, `Rs` from **kpc/h → Mpc/h** (division by 1000).
-      2) **Dense 2D array** (no field names, shape (N, C)).
-         - Infers schema by column count: C ≥ 10 ⇒ with R, else C ≥ 8 ⇒ no R.
-         - Assumes fixed column order in the first 8–10 columns (x..id).
-         - Converts `Rvir`, `Rs` from **kpc/h → Mpc/h** (as above).
+    The yielded arrays always follow the canonical convention
+
+        [x, y, z, vx, vy, vz, logM, Rvir, Rs, id].
+
+    If structural radii are present, they are interpreted as kpc/h and
+    converted to Mpc/h.
 
     Parameters
     ----------
-    filename : str | pathlib.Path
-        Path to the input HDF5 file.
-    chunk_size : int, default 10000
-        Maximum number of rows per yielded block.
+    filename : str or Path
+        Path to the HDF5 input file.
+    chunk_size : int, optional
+        Maximum number of rows per yielded chunk.
 
     Yields
     ------
-    np.ndarray, shape (n, 10), dtype float
-        Chunk with the canonical column order:
-        x, y, z, vx, vy, vz, logM, Rvir[Mpc/h], Rs[Mpc/h], id
+    ndarray
+        Halo chunk in canonical format.
 
-    Notes
-    -----
-    - The function tries to auto-detect a main dataset under names:
-        'halos', 'Halo', 'data', 'catalog'.
-      If none matches, it lists the available paths and raises a ValueError.
-    - If your file already stores `Rvir`, `Rs` in **Mpc/h**, remove the `/1000.0`
-      conversions where indicated.
-    - The `id` column is cast to float in the structured branch to fit the (n,10)
-      float array. If you need integer IDs downstream, cast back with `.astype(int)`.
-
-    Examples
-    --------
-    >>> for blk in read_hdf5_chunked("halos.h5", chunk_size=50000):
-    ...     x, y, z = blk[:,0], blk[:,1], blk[:,2]
-    ...     logM     = blk[:,6]
-    ...     Rvir     = blk[:,7]   # Mpc/h (or NaN if not present)
-    ...     # process each chunk...
+    Raises
+    ------
+    ValueError
+        If no suitable dataset is found or if the dataset shape is incompatible.
     """
     try:
         import h5py
@@ -1228,6 +1399,10 @@ Radial Profile (satellites)
 
 - (If used) Rvir, Rs are expected in Mpc/h in your pipeline after I/O conversion.
 
+- Rmax   : Maximum radius [Mpc/h] used for the extended radial profile.
+           Satellite radii are sampled only up to this value.
+           It should match the radial range used when fitting the profile.
+
 Velocity Parameters (satellites)
 --------------------------------
 - vfact : Velocity scale factor (≈ 0.5-1.5).
@@ -1290,6 +1465,7 @@ def print_run_summary(params) -> None:
     print(f"  alpha    = {params.alpha:.1f}")
     print(f"  sig      = {params.sig:.2f}")
     print(f"  gamma    = {params.gamma:.1f}")
+    print(f"  Rmax     = {params.Rmax:.3f}")
 
     print("Derived parameters:")
     print(f"  M0 = {params.M0:.6e}")
@@ -1430,6 +1606,24 @@ def read_occupation_from_h5(h5file: str | Path) -> Tuple[np.ndarray, np.ndarray,
         Nsat_mean = np.divide(Nsat, N_h, out=np.zeros_like(Nsat, dtype=float), where=(N_h > 0))
 
     return M_min, M_max, Ncen_mean, Nsat_mean
+
+
+def convert_txt_to_npy(txt_filename):
+    txt_filename = Path(txt_filename)
+
+    output_dir = Path("output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    npy_filename = output_dir / f"{txt_filename.stem}.npy"
+
+    print(f"[INFO] Fast converting {txt_filename} → {npy_filename}")
+
+    data = np.loadtxt(txt_filename)
+    np.save(npy_filename, data)
+
+    print(f"[INFO] Saved binary cache: {npy_filename}")
+
+    return npy_filename
 
 
 def read_global_conformity_factors(h5file: str | Path) -> Tuple[float, float]:
